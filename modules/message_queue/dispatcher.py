@@ -42,7 +42,7 @@ class Dispatcher:
             num_workers: 处理窗口数量
         """
         self._ring_buffer = ring_buffer #下划线表示私有属性
-        self._workers = [Worker(worker_id=i) for i in range(num_workers)]
+        self._workers = [Worker(worker_id=i) for i in range(num_workers)] #创建3个Worker实例
         self._num_workers = num_workers
 
         self._running = False
