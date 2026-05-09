@@ -149,8 +149,11 @@ class LLDPCollector:
             port_id_str = str(port_no)
             lldp_frame = build_lldp_frame(chassis_mac, port_id_str)
 
-            # 构造 PacketOut
-            actions = [parser.OFPActionOutput(port_no)]
+            # 构造 PacketOut（metadata=1 标记东向，供主控 TransparentProxy 识别）
+            actions = [
+                parser.OFPActionSetField(metadata=1),
+                parser.OFPActionOutput(port_no),
+            ]
             out = parser.OFPPacketOut(
                 datapath=dp,
                 buffer_id=ofproto.OFP_NO_BUFFER,

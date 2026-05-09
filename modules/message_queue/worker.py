@@ -143,13 +143,13 @@ class Worker:
         # 安全过滤器（每个 Worker 独立实例）
         self._security_filter = SecurityFilter()
 
-        # ── 输出队列（按消息类型路由，零拷贝） ──
+        # ── 输出队列引用（默认自建，可通过 set_output_queues 替换为共享队列） ──
         # topo_east_queue: LLDP → 拓扑发现模块（TopologyProcessor）
         # perf_east_queue: IP   → 性能检测模块（PerformanceMonitor）
         # west_queue:      ARP/OTHER → 路由管理模块（Phase 4）
-        self.topo_east_queue = queue.Queue(maxsize=queue_size)
-        self.perf_east_queue = queue.Queue(maxsize=queue_size)
-        self.west_queue = queue.Queue(maxsize=queue_size)
+        self.topo_east_queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self.perf_east_queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self.west_queue: queue.Queue = queue.Queue(maxsize=queue_size)
 
         # ── 线程状态 ──
         self._running = False
@@ -162,6 +162,22 @@ class Worker:
         self._total_west = 0
         self._total_dropped = 0
         self._total_no_input = 0
+
+    def set_output_queues(self, topo_q: queue.Queue, perf_q: queue.Queue, west_q: queue.Queue):
+        """
+        替换输出队列为外部共享队列（多 Worker 写同一队列）
+
+        调用此方法后，所有 Worker 将写入同一个 topo_q / perf_q / west_q，
+        消费端只需从一个队列取消息，无需轮询多队列。
+
+        Args:
+            topo_q: 共享拓扑队列（LLDP 消息）
+            perf_q: 共享性能队列（IP 消息）
+            west_q: 共享西向队列（ARP/OTHER 消息）
+        """
+        self.topo_east_queue = topo_q
+        self.perf_east_queue = perf_q
+        self.west_queue = west_q
 
     # ──────────────────────────────────────────────
     # 兼容旧接口（外部可能直接访问 east_queue）

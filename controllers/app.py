@@ -43,6 +43,7 @@ from modules.message_queue.ring_buffer import RingBuffer
 from modules.message_queue.dispatcher import Dispatcher
 from modules.topology.collector import LLDPCollector
 from modules.topology.processor import TopologyProcessor
+from modules.topology.lldp_utils import dpid_to_mac
 from modules.performance.monitor import PerformanceMonitor
 
 
@@ -132,6 +133,9 @@ class SDNController(app_manager.RyuApp):
 
         # ── Phase 2: 注册交换机到 LLDP 采集器 ──
         self.lldp_collector.register_switch(dpid, datapath)
+
+        # 同步预注册到拓扑校验器（避免"先有鸡还是先有蛋"死锁）
+        self.topology_processor.validator.register_device(dpid_to_mac(dpid))
 
         self.logger.info(f"🔌 Switch {dpid:016x} connected (LLDP registered)")
 

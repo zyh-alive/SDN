@@ -222,7 +222,9 @@ def parse_lldp_frame(raw_data: bytes) -> Optional[LLDPPacket]:
         return None
 
     # 验证 ethertype
-    ethertype = struct.unpack("!H", raw_data[12:14])[0]
+    ethertype = struct.unpack("!H", raw_data[12:14])[0] #!H 表示网络字节序的无符号短整数[12:14] 
+    #是以太网帧头中的 ethertype 字段,[0]表示取 unpack 返回的元组中的第一个元素，即 ethertype 的值
+    #unpack 将字节数据转换为 Python 数据类型，!H 表示网络字节序的无符号短整数（2 字节）
     if ethertype != LLDP_ETHERTYPE:
         return None
 
