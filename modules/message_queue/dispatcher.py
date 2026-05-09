@@ -1,5 +1,5 @@
 """
-Hash Dispatcher（单线程分发器）
+Hash Dispatcher（多线程分发器）
 
 功能：
 1. 从 Ring Buffer 消费消息（阻塞读取）
@@ -7,11 +7,14 @@ Hash Dispatcher（单线程分发器）
 3. 浅解析：根据 ethertype 判断消息类型（LLDP/ARP/IP/其他）
 4. 同时支持直接 dispatch（西向消息走快通道，跳过 Ring Buffer）
 
-设计：
-- 单线程运行（run 方法），避免多线程竞争
-- Hash 分发保证同一 (dpid, in_port) 的包到同一 Worker（避免乱序）
+架构变更 (Phase 2.5 多线程改造)：
+  - _dispatch_to_worker() 改为非阻塞 worker.input_queue.put(msg)
+  - start() 同时启动所有 Worker 线程
+  - stop() 同时停止所有 Worker 线程
+  - Dispatcher 线程仅负责 pop → hash → put，延迟降至最低
 """
 
+import queue
 import struct
 import threading
 from typing import Optional, Tuple
@@ -22,11 +25,15 @@ from modules.message_queue.worker import Worker
 
 class Dispatcher:
     """
-    单线程消息分发器
+    多线程消息分发器
 
     消息流：
-    - Ring Buffer → Dispatcher → Worker.handle()
-    - 直接 dispatch() → Worker.handle()（西向快通道）
+    - Ring Buffer → Dispatcher 线程 → worker.input_queue.put() → Worker 线程
+    - 直接 dispatch() → worker.input_queue.put()（西向快通道）
+
+    线程拓扑（共 1 + N 线程）：
+    - 1 个 Dispatcher 线程：pop → hash → put (极轻量)
+    - N 个 Worker 线程：get → 过滤 → 解析 → 写入输出队列（CPU 密集型）
     """
 
     # 支持的 EtherType
@@ -41,8 +48,8 @@ class Dispatcher:
             ring_buffer: 东向 SPSC Ring Buffer（生产者=主控，消费者=本 Dispatcher）
             num_workers: 处理窗口数量
         """
-        self._ring_buffer = ring_buffer #下划线表示私有属性
-        self._workers = [Worker(worker_id=i) for i in range(num_workers)] #创建3个Worker实例
+        self._ring_buffer = ring_buffer
+        self._workers = [Worker(worker_id=i) for i in range(num_workers)]
         self._num_workers = num_workers
 
         self._running = False
@@ -56,27 +63,59 @@ class Dispatcher:
     def workers(self) -> list:
         return self._workers
 
+    # ──────────────────────────────────────────────
+    # 生命周期
+    # ──────────────────────────────────────────────
+
     def start(self):
-        """启动分发器线程"""
+        """启动 Dispatcher 线程 + 所有 Worker 线程"""
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(target=self._run_loop, name="Dispatcher", daemon=True)
+
+        # 先启动所有 Worker 线程
+        for worker in self._workers:
+            worker.start()
+
+        # 再启动 Dispatcher 消费线程
+        self._thread = threading.Thread(
+            target=self._run_loop, name="Dispatcher", daemon=True
+        )
         self._thread.start()
 
     def stop(self):
-        """停止分发器"""
+        """停止 Dispatcher + 所有 Worker 线程"""
         self._running = False
 
-    def _run_loop(self):  #私有方法，Dispatcher线程的主循环
+        # 停止 Dispatcher 线程
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+        # 停止所有 Worker 线程
+        for worker in self._workers:
+            worker.stop()
+
+    # ──────────────────────────────────────────────
+    # Dispatcher 主循环
+    # ──────────────────────────────────────────────
+
+    def _run_loop(self):
         """
-        主循环：从 Ring Buffer 阻塞读取 → 分发到 Worker
+        Dispatcher 线程主循环
+
+        从 Ring Buffer 阻塞读取 → hash 分发 → 非阻塞 put 到 Worker input_queue。
+        不执行任何 CPU 密集型操作，延迟极低。
         """
         while self._running:
-            msg = self._ring_buffer.pop(timeout=1.0)
+            msg = self._ring_buffer.pop(timeout=0.5)
             if msg is None:
                 continue
             self._dispatch_to_worker(msg, via_east=True)
+
+    # ──────────────────────────────────────────────
+    # 分发逻辑
+    # ──────────────────────────────────────────────
 
     def dispatch(self, msg) -> None:
         """
@@ -89,10 +128,10 @@ class Dispatcher:
 
     def _dispatch_to_worker(self, msg, via_east: bool):
         """
-        将消息分发到固定的 Worker
+        将消息非阻塞推送到固定 Worker 的 input_queue
 
         分发策略：hash(dpid, in_port) % num_workers
-        保证同一端口的数据包顺序进入同一 Worker
+        保证同一端口的数据包顺序进入同一 Worker（保序）。
         """
         try:
             dpid = msg.datapath.id
@@ -105,12 +144,27 @@ class Dispatcher:
             in_port = 0
 
         idx = hash((dpid, in_port)) % self._num_workers
-        self._workers[idx].handle(msg)
+        worker = self._workers[idx]
+
+        # 非阻塞 put：Dispatcher 不等待 Worker 处理完成
+        try:
+            worker.input_queue.put(msg, timeout=0.05)
+        except queue.Full:
+            # Worker 输入队列满：丢弃最旧消息后重试
+            try:
+                worker.input_queue.get_nowait()
+                worker.input_queue.put_nowait(msg)
+            except queue.Empty:
+                pass
 
         if via_east:
             self._total_dispatched_east += 1
         else:
             self._total_dispatched_west += 1
+
+    # ──────────────────────────────────────────────
+    # 静态工具
+    # ──────────────────────────────────────────────
 
     @staticmethod
     def parse_ethertype(data: bytes) -> int:
@@ -130,7 +184,6 @@ class Dispatcher:
         """
         if len(data) < 14:
             return 0
-        # ethertype 在第 12-13 字节（偏移 12，大端序）
         return struct.unpack("!H", data[12:14])[0]
 
     def stats(self) -> dict:

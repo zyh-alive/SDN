@@ -1,13 +1,18 @@
 """
-处理窗口 Worker
+处理窗口 Worker（多线程架构）
 
 功能：
 1. 安全过滤：检查包大小、以太网帧头合法性、畸形包头
 2. 浅解析分类：根据 ethertype 判断消息类型（LLDP → 东向 / ARP&IP → 西向）
 3. 数据结构化：封装为标准 Message 对象
-4. 写入对应模块队列（east_queue / west_queue）
+4. Fan-out 写入：LLDP 同时写入 topo_east_queue + perf_east_queue（避免竞争）
 
-每个 Worker 在独立线程中运行，三个 Worker 功能完全一致，无优先级划分。
+架构变更 (Phase 2.5 多线程改造)：
+  - 每个 Worker 运行独立 daemon 线程，从 input_queue 消费
+  - Dispatcher 非阻塞 put() → Worker 线程 get() → 并行处理
+  - 三个 Worker 线程由 OS 调度器实现时间片重叠（类似 Promise 并行效果）
+  - topo_east_queue / perf_east_queue 分离，消除 TopologyProcessor 与 PerformanceMonitor
+    对同一队列的竞争消费问题
 """
 
 import queue
@@ -114,42 +119,127 @@ class SecurityFilter:
 
 class Worker:
     """
-    处理窗口
+    处理窗口（多线程 Actor 模式）
 
-    职责：
-    - 安全过滤
-    - 浅解析分类（仅看 ethertype）
-    - 数据结构化为 StructuredMessage
-    - 写入东/西向队列
+    每个 Worker 运行独立 daemon 线程：
+      input_queue.get() → 安全过滤 → 浅解析 → 写入输出队列
+
+    输出队列（按消息类型路由，零拷贝）：
+      - topo_east_queue: LLDP → 拓扑发现模块
+      - perf_east_queue: IP   → 性能检测模块
+      - west_queue:      ARP/OTHER → 路由管理模块（Phase 4）
     """
+
+    # input_queue 满时丢弃策略的超时时间
+    _PUT_TIMEOUT = 0.05
 
     def __init__(self, worker_id: int, queue_size: int = 10000):
         self.worker_id = worker_id
         self.logger = None  # 由外部注入
 
+        # ── 输入队列（Dispatcher → Worker 线程） ──
+        self.input_queue = queue.Queue(maxsize=queue_size)
+
         # 安全过滤器（每个 Worker 独立实例）
         self._security_filter = SecurityFilter()
 
-        # 输出队列
-        # east_queue: 采集数据 → 拓扑发现模块 + 性能检测模块
-        # west_queue: 首包数据 → 路由管理模块
-        self.east_queue = queue.Queue(maxsize=queue_size)
+        # ── 输出队列（按消息类型路由，零拷贝） ──
+        # topo_east_queue: LLDP → 拓扑发现模块（TopologyProcessor）
+        # perf_east_queue: IP   → 性能检测模块（PerformanceMonitor）
+        # west_queue:      ARP/OTHER → 路由管理模块（Phase 4）
+        self.topo_east_queue = queue.Queue(maxsize=queue_size)
+        self.perf_east_queue = queue.Queue(maxsize=queue_size)
         self.west_queue = queue.Queue(maxsize=queue_size)
 
-        # 统计
+        # ── 线程状态 ──
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+        # ── 统计 ──
         self._total_handled = 0
         self._total_east = 0
+        self._total_perf = 0
         self._total_west = 0
         self._total_dropped = 0
+        self._total_no_input = 0
+
+    # ──────────────────────────────────────────────
+    # 兼容旧接口（外部可能直接访问 east_queue）
+    # ──────────────────────────────────────────────
+
+    @property
+    def east_queue(self):
+        """
+        向后兼容：返回 topo_east_queue。
+        新代码应直接使用 topo_east_queue / perf_east_queue。
+        """
+        return self.topo_east_queue
+
+    # ──────────────────────────────────────────────
+    # 生命周期
+    # ──────────────────────────────────────────────
 
     def set_logger(self, logger):
         """注入日志器"""
         self.logger = logger
         self._security_filter.logger = logger
 
-    def handle(self, msg) -> Optional[StructuredMessage]:
+    def start(self):
+        """启动 Worker 处理线程"""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name=f"Worker-{self.worker_id}",
+            daemon=True,
+        )
+        self._thread.start()
+        if self.logger:
+            self.logger.debug(f"[Worker-{self.worker_id}] Thread started")
+
+    def stop(self):
+        """停止 Worker 处理线程"""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        if self.logger:
+            self.logger.debug(f"[Worker-{self.worker_id}] Thread stopped")
+
+    # ──────────────────────────────────────────────
+    # 线程主循环
+    # ──────────────────────────────────────────────
+
+    def _run_loop(self):
         """
-        处理入口（由 Dispatcher 调用）
+        Worker 线程主循环
+
+        从 input_queue 阻塞读取 → 处理 → 写入输出队列
+        由 OS 调度器实现三个 Worker 的时间片重叠并行。
+        """
+        while self._running:
+            try:
+                msg = self.input_queue.get(timeout=0.5)
+            except queue.Empty:
+                self._total_no_input += 1
+                continue
+
+            try:
+                self._handle_one(msg)
+            except Exception:
+                if self.logger:
+                    self.logger.exception(
+                        f"[Worker-{self.worker_id}] Unhandled error in _handle_one"
+                    )
+
+    # ──────────────────────────────────────────────
+    # 核心处理逻辑（单条消息，仅在 Worker 线程内调用）
+    # ──────────────────────────────────────────────
+
+    def _handle_one(self, msg) -> Optional[StructuredMessage]:
+        """
+        处理单条消息（内部方法，由 _run_loop 调用）
 
         Args:
             msg: Ryu PacketIn 消息对象 (ev.msg)
@@ -198,11 +288,17 @@ class Worker:
             data=raw_data,
         )
 
-        # 5. 写入对应队列（LLDP → 东向，ARP/IP → 西向）
+        # 5. 按类型路由到输出队列（零拷贝：每条消息只去一个队列）
         if msg_type == StructuredMessage.TYPE_LLDP:
-            self._put_to_queue(self.east_queue, structured)
+            # LLDP → 拓扑发现（TopologyProcessor 消费）
+            self._put_to_queue(self.topo_east_queue, structured)
             self._total_east += 1
+        elif msg_type == StructuredMessage.TYPE_IP:
+            # IP 包 → 性能检测（PerformanceMonitor 消费）
+            self._put_to_queue(self.perf_east_queue, structured)
+            self._total_perf += 1
         else:
+            # ARP / OTHER → 西向队列（未来路由模块消费）
             self._put_to_queue(self.west_queue, structured)
             self._total_west += 1
 
@@ -215,6 +311,23 @@ class Worker:
             )
 
         return structured
+
+    # ──────────────────────────────────────────────
+    # 公共接口（保留 handle() 用于测试/直接调用场景）
+    # ──────────────────────────────────────────────
+
+    def handle(self, msg) -> Optional[StructuredMessage]:
+        """
+        同步处理入口（保留用于测试和兼容场景）
+
+        注意：多线程架构下 Dispatcher 通过 input_queue.put() 分发，
+        不再调用此方法。此方法仅用于纯 Python 单元测试中直接调用。
+        """
+        return self._handle_one(msg)
+
+    # ──────────────────────────────────────────────
+    # 工具方法
+    # ──────────────────────────────────────────────
 
     def _put_to_queue(self, q: queue.Queue, item):
         """线程安全地放入队列，满时丢弃最旧消息"""
@@ -233,10 +346,15 @@ class Worker:
             "worker_id": self.worker_id,
             "total_handled": self._total_handled,
             "east_count": self._total_east,
+            "perf_count": self._total_perf,
             "west_count": self._total_west,
             "dropped": self._total_dropped,
-            "east_queue_size": self.east_queue.qsize(),
+            "no_input": self._total_no_input,
+            "input_queue_size": self.input_queue.qsize(),
+            "topo_east_queue_size": self.topo_east_queue.qsize(),
+            "perf_east_queue_size": self.perf_east_queue.qsize(),
             "west_queue_size": self.west_queue.qsize(),
+            "running": self._running,
             "security": self._security_filter.stats(),
         }
 
@@ -246,5 +364,5 @@ class Worker:
             f"Worker({self.worker_id}) "
             f"handled={s['total_handled']} "
             f"east={s['east_count']} west={s['west_count']} "
-            f"dropped={s['dropped']}"
+            f"dropped={s['dropped']} running={s['running']}"
         )

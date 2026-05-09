@@ -1,14 +1,22 @@
 """
-Ryu 主控制器 — 集成消息队列架构 + 拓扑发现 + 性能检测 (Phase 2)
+Ryu 主控制器 — 集成消息队列架构 + 拓扑发现 + 性能检测 (Phase 2.5 多线程)
 
 数据流：
   PacketIn → SecurityFilter(前置) → TransparentProxy(元数据分类)
-    ├─ 东向 (LLDP/拓扑探测) → Ring Buffer → Dispatcher(异步) → Workers → east_queue
+    ├─ 东向 (LLDP/拓扑探测) → Ring Buffer → Dispatcher(异步) → Workers → topo_east_queue + perf_east_queue
     └─ 西向 (ARP/IP/首包)   → Dispatcher.dispatch(快通道) → Workers → west_queue
 
-下游消费：
-  east_queue → 拓扑发现模块 (LLDP 采集 + 拓扑处理) + 性能检测模块 (四指标 + 拥堵等级)
+下游消费（fan-out 修复）：
+  topo_east_queue → 拓扑发现模块 (LLDP 采集 + 拓扑处理)
+  perf_east_queue → 性能检测模块 (四指标 + 拥堵等级)
   west_queue → 路由管理模块 (Phase 4)
+
+多线程架构：
+  - Dispatcher 线程 × 1: pop(RingBuffer) → hash → put(Worker.input_queue)
+  - Worker 线程 × 3: get(input_queue) → 过滤/解析 → put(topo_east + perf_east + west)
+  - TopologyConsumer 线程 × 1: get(topo_east) → process_structured_message()
+  - PerfMonitor 线程 × 1: get(perf_east) → 字节累积 + ICMP 匹配
+  - LLDP 定时器 (eventlet): 100ms 排空下行队列 + 发送周期
 """
 
 import sys
@@ -60,7 +68,7 @@ class SDNController(app_manager.RyuApp):
         for worker in self.dispatcher.workers:
             worker.set_logger(self.logger)
 
-        # 启动 Dispatcher 消费线程
+        # ── 启动 Dispatcher + Worker 线程（多线程架构） ──
         self.dispatcher.start()
 
         # ── Phase 2: 拓扑发现模块 ──
@@ -73,15 +81,15 @@ class SDNController(app_manager.RyuApp):
         # 启动 LLDP 下行排空定时器（主控线程安全发送 PacketOut）
         self._start_lldp_drain_timer()
 
-        # 启动拓扑消费线程（从 east_queue 消费 LLDP 消息送入 processor）
+        # 启动拓扑消费线程（从 topo_east_queue 消费 LLDP 消息送入 processor）
         self._start_topology_consumer()
 
         # 启动 LLDP 采集器（定期发送 LLDP）
         self.lldp_collector.start()
 
-        # ── Phase 2: 性能检测模块 ──
-        east_queues = self.get_east_queues()
-        self.perf_monitor = PerformanceMonitor(east_queues, logger=self.logger)
+        # ── Phase 2: 性能检测模块（fan-out 修复：使用独立 perf_east_queue） ──
+        perf_queues = self.get_perf_east_queues()
+        self.perf_monitor = PerformanceMonitor(perf_queues, logger=self.logger)
 
         # 启动性能监控
         self.perf_monitor.start()
@@ -91,14 +99,15 @@ class SDNController(app_manager.RyuApp):
         self._stats_interval = 10.0  # 每 10 秒输出一次综合统计
 
         self.logger.info("=" * 60)
-        self.logger.info("SDN 主控制器启动（Phase 2: 消息队列 + 拓扑 + 性能检测）")
+        self.logger.info("SDN 主控制器启动（Phase 2.5: 多线程 + fan-out 修复）")
         self.logger.info(f"📍 Ring Buffer: capacity={self.ring_buffer.capacity}")
-        self.logger.info(f"📍 Dispatcher: {len(self.dispatcher.workers)} workers, "
-                         f"running={self.dispatcher.stats()['dispatcher']['running']}")
-        self.logger.info("📍 东向通道: PacketIn → RingBuffer → Dispatcher → Workers → east_queue")
+        self.logger.info(f"📍 Dispatcher: {len(self.dispatcher.workers)} workers "
+                         f"+ {len(self.dispatcher.workers)} worker threads "
+                         f"(total {1 + len(self.dispatcher.workers)} threads)")
+        self.logger.info("📍 东向通道(fan-out): PacketIn → RingBuffer → Dispatcher → Workers → topo_east + perf_east")
         self.logger.info("📍 西向通道: PacketIn → Dispatcher.dispatch() → Workers → west_queue")
-        self.logger.info("📍 拓扑发现: LLDPCollector + TopologyProcessor")
-        self.logger.info("📍 性能检测: PerformanceMonitor (ICMP RTT + 吞吐量累积)")
+        self.logger.info("📍 拓扑发现: LLDPCollector + TopologyProcessor (topo_east_queue)")
+        self.logger.info("📍 性能检测: PerformanceMonitor (perf_east_queue)")
         self.logger.info("=" * 60)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)  # type: ignore[attr-defined]
@@ -175,21 +184,37 @@ class SDNController(app_manager.RyuApp):
         )
 
     def _log_comprehensive_stats(self):
-        """输出 Phase 2 综合统计（拓扑 + 性能 + 消息队列）"""
+        """输出 Phase 2.5 综合统计（拓扑 + 性能 + 消息队列 + 线程状态）"""
         topo_stats = self.topology_processor.stats()
         perf_stats = self.perf_monitor.stats()
+        ds = self.dispatcher.stats()
+
+        # Worker 线程状态
+        worker_states = []
+        for w in ds['workers']:
+            worker_states.append(
+                f"W{w['worker_id']}(east={w['east_count']} "
+                f"perf={w['perf_count']} west={w['west_count']} "
+                f"q_topo={w['topo_east_queue_size']} "
+                f"q_perf={w['perf_east_queue_size']} "
+                f"running={w['running']})"
+            )
 
         self.logger.info(
-            f"📊 [Phase 2] Topology: {topo_stats['graph']['switches']} switches, "
+            f"📊 [Phase 2.5] Topology: {topo_stats['graph']['switches']} switches, "
             f"{topo_stats['graph']['links']} links (v{topo_stats['graph']['version']}), "
             f"LLDP valid={topo_stats['lldp_valid']} invalid={topo_stats['lldp_invalid']}"
         )
 
         self.logger.info(
-            f"📊 [Phase 2] PerfMonitor: consumed={perf_stats['total_consumed']}, "
+            f"📊 [Phase 2.5] PerfMonitor: consumed={perf_stats['total_consumed']}, "
             f"ICMP matched={perf_stats['total_icmp_matched']}, "
             f"active_links={perf_stats['active_links']}, "
             f"levels={perf_stats['detector']['level_distribution']}"
+        )
+
+        self.logger.info(
+            f"📊 [Phase 2.5] Workers: {' | '.join(worker_states)}"
         )
 
     # ──────────────────────────────────────────────
@@ -217,16 +242,16 @@ class SDNController(app_manager.RyuApp):
         hub.spawn(_timer_loop)
 
     # ──────────────────────────────────────────────
-    # Phase 2: 拓扑消费线程
+    # Phase 2: 拓扑消费线程（fan-out 修复后从 topo_east_queue 消费）
     # ──────────────────────────────────────────────
 
     def _start_topology_consumer(self):
-        """启动拓扑消费线程：从 east_queue 读取 LLDP，送入 topology_processor"""
-        east_queues = self.get_east_queues()
+        """启动拓扑消费线程：从 topo_east_queue 读取 LLDP，送入 topology_processor"""
+        topo_queues = self.get_topo_east_queues()
 
         def _consumer_loop():
             while True:
-                for q in east_queues:
+                for q in topo_queues:
                     try:
                         msg = q.get(timeout=0.5)
                     except Exception:
@@ -244,9 +269,20 @@ class SDNController(app_manager.RyuApp):
     # 公共接口
     # ──────────────────────────────────────────────
 
+    def get_topo_east_queues(self):
+        """获取所有 Worker 的拓扑东向队列（供拓扑发现模块消费）"""
+        return [w.topo_east_queue for w in self.dispatcher.workers]
+
+    def get_perf_east_queues(self):
+        """获取所有 Worker 的性能东向队列（供性能检测模块消费）"""
+        return [w.perf_east_queue for w in self.dispatcher.workers]
+
     def get_east_queues(self):
-        """获取所有 Worker 的东向队列引用（供拓扑/性能模块消费）"""
-        return [w.east_queue for w in self.dispatcher.workers]
+        """
+        向后兼容：返回拓扑东向队列列表。
+        新代码应使用 get_topo_east_queues() / get_perf_east_queues()。
+        """
+        return self.get_topo_east_queues()
 
     def get_west_queues(self):
         """获取所有 Worker 的西向队列引用（供路由模块消费）"""
