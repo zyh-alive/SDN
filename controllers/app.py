@@ -45,6 +45,9 @@ from modules.topology.collector import LLDPCollector
 from modules.topology.processor import TopologyProcessor
 from modules.topology.lldp_utils import dpid_to_mac
 from modules.performance.monitor import PerformanceMonitor
+from storage.redis_client import RedisClient
+from modules.stalker.stalker_manager import StalkerManager
+from modules.routing.route_manager import RouteManager
 
 
 class SDNController(app_manager.RyuApp):
@@ -72,9 +75,22 @@ class SDNController(app_manager.RyuApp):
         # ── 启动 Dispatcher + Worker 线程（多线程架构） ──
         self.dispatcher.start()
 
+        # ── Phase 3: 初始化 Redis ──
+        self.redis_client = RedisClient(logger=self.logger)
+        self.redis_client.init_topology_keys()
+
+        # ── Phase 3: 初始化 StalkerManager + RouteManager ──
+        self.stalker_manager = StalkerManager(logger=self.logger)
+        self.route_manager = RouteManager(logger=self.logger)
+        self.stalker_manager.register(self.route_manager, wake_order=0)
+        self.logger.info("📡 Phase 3: StalkerManager + RouteManager registered")
+
         # ── Phase 2: 拓扑发现模块 ──
         self.lldp_collector = LLDPCollector(logger=self.logger)
-        self.topology_processor = TopologyProcessor(logger=self.logger)
+        self.topology_processor = TopologyProcessor(logger=self.logger,
+                                                     redis_client=self.redis_client)
+        # 进程内通知：processor → StalkerManager → RouteManager（零 Redis 中间层）
+        self.topology_processor.set_stalker_manager(self.stalker_manager)
 
         # 启动拓扑处理器（防抖窗口 + 超时扫描）
         self.topology_processor.start()
@@ -100,7 +116,7 @@ class SDNController(app_manager.RyuApp):
         self._stats_interval = 10.0  # 每 10 秒输出一次综合统计
 
         self.logger.info("=" * 60)
-        self.logger.info("SDN 主控制器启动（Phase 2.5: 多线程 + fan-out 修复）")
+        self.logger.info("SDN 主控制器启动（Phase 3: Redis 拓扑快照 + Storage 层）")
         self.logger.info(f"📍 Ring Buffer: capacity={self.ring_buffer.capacity}")
         self.logger.info(f"📍 Dispatcher: {len(self.dispatcher.workers)} workers "
                          f"+ {len(self.dispatcher.workers)} worker threads "
@@ -205,20 +221,21 @@ class SDNController(app_manager.RyuApp):
             )
 
         self.logger.info(
-            f"📊 [Phase 2.5] Topology: {topo_stats['graph']['switches']} switches, "
+            f"📊 [Phase 3] Topology: {topo_stats['graph']['switches']} switches, "
             f"{topo_stats['graph']['links']} links (v{topo_stats['graph']['version']}), "
-            f"LLDP valid={topo_stats['lldp_valid']} invalid={topo_stats['lldp_invalid']}"
+            f"LLDP valid={topo_stats['lldp_valid']} invalid={topo_stats['lldp_invalid']}, "
+            f"Redis={'✅' if topo_stats.get('redis_connected') else '❌'}"
         )
 
         self.logger.info(
-            f"📊 [Phase 2.5] PerfMonitor: consumed={perf_stats['total_consumed']}, "
+            f"📊 [Phase 3] PerfMonitor: consumed={perf_stats['total_consumed']}, "
             f"ICMP matched={perf_stats['total_icmp_matched']}, "
             f"active_links={perf_stats['active_links']}, "
             f"levels={perf_stats['detector']['level_distribution']}"
         )
 
         self.logger.info(
-            f"📊 [Phase 2.5] Workers: {' | '.join(worker_states)}"
+            f"📊 [Phase 3] Workers: {' | '.join(worker_states)}"
         )
 
     # ──────────────────────────────────────────────

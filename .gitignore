@@ -26,9 +26,15 @@ env/
 .DS_Store
 Thumbs.db
 
+# Environment
+.env
+
 # Project specific
 *.pkl
 *.h5
 *.pb
 models/*.pkl
 models/*.h5
+
+#Note
+*.md

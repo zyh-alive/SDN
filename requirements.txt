@@ -30,3 +30,5 @@ tomli==2.4.1
 typing_extensions==4.15.0
 urllib3==2.6.3
 WebOb==1.8.9
+redis==7.4.0
+async-timeout==5.0.1

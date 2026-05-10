@@ -1,22 +1,24 @@
 # 面向多业务 QoS 的分布式透传 SDN 架构 — 最终工程化方案
 
-> 原则：完整保留原设计创新点，剔除不切实际/过度设计，细化所有模糊边界，给出可直接编码的接口规范。
+> **原则**：完整保留原设计创新点，剔除不切实际/过度设计，细化所有模糊边界，给出可直接编码的接口规范。
+>
+> **状态标注**：✅ 已实现 / 🔧 实现中 / 📐 已规划（接口已定义，待实现）
 
 ---
 
 ## 目录
 
-1. [整体架构（Mermaid 图）](#1-整体架构)
-2. [主控制器模块](#2-主控制器模块)
-3. [消息队列模块](#3-消息队列模块)
-4. [拓扑发现模块](#4-拓扑发现模块)
-5. [性能检测模块](#5-性能检测模块)
-6. [分区数据库 + 盯梢者架构](#6-分区数据库--盯梢者架构)
-7. [QoS-KPS 路由决策](#7-qos-kps-路由决策)
-8. [流表管理模块](#8-流表管理模块)
-9. [限速模块（Meter + 队列）](#9-限速模块meter--队列)
-10. [流量分类 + 流量预测模块](#10-流量分类--流量预测模块)
-11. [前端系统](#11-前端系统)
+1. [整体架构](#1-整体架构)
+2. [主控制器模块](#2-主控制器模块) ✅
+3. [消息队列模块](#3-消息队列模块) ✅
+4. [拓扑发现模块](#4-拓扑发现模块) ✅
+5. [性能检测模块](#5-性能检测模块) ✅
+6. [分区数据库 + 盯梢者架构](#6-分区数据库--盯梢者架构) 🔧
+7. [QoS-KPS 路由决策](#7-qos-kps-路由决策) 📐
+8. [流表管理模块](#8-流表管理模块) 📐
+9. [限速模块（Meter + 队列）](#9-限速模块meter--队列) 📐
+10. [流量分类 + 流量预测模块](#10-流量分类--流量预测模块) 📐
+11. [前端系统](#11-前端系统) 📐
 12. [Redis Key 规范](#12-redis-key-规范)
 13. [MySQL 表结构](#13-mysql-表结构)
 14. [目录结构](#14-目录结构)
@@ -26,663 +28,704 @@
 
 ## 1. 整体架构
 
-```mermaid
-graph TB
-    subgraph DataPlane["数据平面层"]
-        OVS1[OVS交换机1]
-        OVS2[OVS交换机2]
-        OVS3[OVS交换机N]
-    end
-
-    subgraph ControlLayer["控制层 - 纯透传"]
-        RYU[Ryu主控制器<br/>零解析透传<br/>东西北三向接口]
-        RB["Ring Buffer<br/>SPSC无锁队列<br/>(collections.deque)"]
-        DISP["Dispatcher<br/>单线程Hash分发器<br/>浅解析:消息类型识别"]
-        W1[处理窗口1]
-        W2[处理窗口2]
-        W3[处理窗口3]
-        EQ["东向队列<br/>采集数据<br/>(拓扑/性能)"]
-        WQ["西向队列<br/>首包数据<br/>(ARP/PacketIn)"]
-    end
-
-    subgraph FuncLayer["功能模块层"]
-        TOPO["拓扑发现<br/>采集/处理分离<br/>Diff Engine增量<br/>防抖窗口+上限"]
-        PERF["性能检测<br/>自适应采样调度<br/>EWMA动态阈值<br/>拥堵等级0-3"]
-        CLASS["流量分类<br/>朴素贝叶斯<br/>定时批量训练"]
-        PRED["流量预测<br/>LSTM短期+长期<br/>定时批量预测"]
-        RM["路由管理<br/>KSP粗筛K=5<br/>主备路径决策<br/>分级路由策略"]
-        RC["路由计算<br/>QoS效用值精算<br/>独立惩罚系数<br/>ARP处理机"]
-        FM["流表管理<br/>策略整合编译<br/>冲突检测<br/>优先级管理"]
-        METER["Meter限速<br/>百分比速率配置<br/>拥堵等级联动"]
-        QUEUE["队列限速<br/>OVSDB优先级队列<br/>差异化速率"]
-    end
-
-    subgraph StorageLayer["数据存储层"]
-        REDIS["Redis分区存储<br/>Stream事件流<br/>Hash拓扑快照<br/>性能时序数据"]
-        MYSQL["MySQL持久化<br/>分区历史表<br/>变更记录<br/>30天自动清理"]
-        SM["Stalker Manager<br/>盯梢者统一管理器<br/>事件路由+唤醒策略<br/>防惊群"]
-    end
-
-    subgraph InteractionLayer["交互层"]
-        NORTH["北向API<br/>gRPC<br/>流表下发通道"]
-        FRONT["前端系统<br/>拓扑可视化<br/>性能监控<br/>流表管理"]
-    end
-
-    OVS1 & OVS2 & OVS3 -->|PacketIn| RYU
-    RYU -->|东向出口| RB
-    RYU -->|西向出口| DISP
-    RB --> DISP
-    DISP -->|Hash分发| W1 & W2 & W3
-    W1 & W2 & W3 -->|安全过滤+分类| EQ
-    W1 & W2 & W3 -->|安全过滤+分类| WQ
-    EQ --> TOPO
-    EQ --> PERF
-    WQ --> RM
-
-    TOPO -->|拓扑快照+事件流| REDIS
-    TOPO -->|变更记录| MYSQL
-    PERF -->|性能Stream+指标Hash| REDIS
-    PERF -->|历史数据| MYSQL
-
-    REDIS --> SM
-    SM -->|拓扑变更| RC
-    SM -->|拓扑变更| RM
-    SM -->|性能告警| METER
-    SM -->|性能告警| QUEUE
-    SM -->|定时批量| CLASS
-    SM -->|定时批量| PRED
-
-    CLASS -->|分类结果| REDIS
-    PRED -->|预测QoS指标| REDIS
-    RC -->|效用值结果| RM
-    RM -->|最优路径| FM
-    METER -->|速率策略| FM
-    QUEUE -->|队列策略| FM
-    FM -->|封装FlowMod| NORTH
-    NORTH -->|流表下发| RYU
-    RYU -->|FlowMod| OVS1 & OVS2 & OVS3
-
-    REDIS --> FRONT
-    MYSQL --> FRONT
-    FRONT -->|REST配置| RM
-    FRONT -->|REST配置| METER
-
-    style RYU fill:#1a1a2e,color:#e0e0e0
-    style SM fill:#16213e,color:#00d2ff
-    style REDIS fill:#533483,color:#fff
-    style DISP fill:#0f3460,color:#e0e0e0
-    style RM fill:#1a3a1a,color:#90ee90
-    style RC fill:#1a3a1a,color:#90ee90
 ```
+                        ┌──────────────────────────────────────┐
+                        │         数据平面层 (Data Plane)        │
+                        │   OVS 交换机 1 .. N                    │
+                        │        ↑↓ PacketIn / FlowMod          │
+                        └──────────────────────────────────────┘
+                                        │
+        ┌───────────────────────────────┴───────────────────────────────┐
+        │                    控制层 (Control Layer) — 纯透传              │
+        │                                                                │
+        │  PacketIn 到达                                                 │
+        │      │                                                         │
+        │      ├─ 1. SecurityFilter (前置): 包大小 > 65535 → 丢弃        │
+        │      │                                                         │
+        │      ├─ 2. TransparentProxy: 读 metadata 字段决定方向           │
+        │      │     metadata == 1 → TYPE_EAST  (东向)                   │
+        │      │     metadata != 1 → TYPE_WEST (西向)                    │
+        │      │                                                         │
+        │      ├─ 东向: RingBuffer.push(msg)                             │
+        │      │     └─ Dispatcher 线程: pop → hash(dpid,in_port)        │
+        │      │           └─ Worker[N].input_queue.put(msg)             │
+        │      │                                                         │
+        │      └─ 西向: Dispatcher.dispatch(msg)  快通道，跳过 RingBuffer │
+        │                  └─ Worker[N].input_queue.put(msg)             │
+        │                                                                │
+        │  Worker 线程 ×3（并行处理）:                                    │
+        │     1. SecurityFilter(深度): 帧长/ethertype/IP 畸形            │
+        │     2. 浅解析分类: LLDP / ARP / IP / OTHER                     │
+        │     3. 数据结构化: StructuredMessage                           │
+        │     4. Fan-out 写入三个输出队列:                                │
+        │          LLDP      → topo_east_queue  (拓扑发现模块消费)        │
+        │          IP        → perf_east_queue  (性能检测模块消费)        │
+        │          ARP/OTHER → west_queue        (路由管理模块消费)       │
+        └───────────────────────────────────────────────────────────────┘
+                                        │
+        ┌───────────────────────────────┴───────────────────────────────┐
+        │                   功能模块层 (Function Layer)                   │
+        │                                                                │
+        │  TopologyConsumer 线程:                                        │
+        │    get(topo_east_queue[0..2]) → TopologyProcessor              │
+        │                                                                │
+        │  TopologyProcessor 线程:                                       │
+        │    LLDP 解析 → 校验 → 防抖窗口(2s/5s) → 更新 TopologyGraph     │
+        │    超时扫描(90s) → 标记 DOWN 链路                              │
+        │                                                                │
+        │  PerformanceMonitor 线程:                                      │
+        │    get(perf_east_queue[0..2]) → 字节累积 + ICMP 配对            │
+        │    MetricsCalculator(四指标) → EWMADetector(拥堵等级 0-3)       │
+        │    AdaptiveScheduler(动态采样间隔)                              │
+        │                                                                │
+        │  LLDPCollector 线程:                                           │
+        │    每 5s 遍历交换机 → 构造 LLDP → downlink_queue               │
+        │                                                                │
+        │  LLDP Drain 定时器 (eventlet):                                 │
+        │    每 100ms 排空 downlink_queue → datapath.send_msg()          │
+        └───────────────────────────────────────────────────────────────┘
+                                        │
+        ┌───────────────────────────────┴───────────────────────────────┐
+        │              数据存储层 (Storage Layer) — Phase 3+              │
+        │                                                                │
+        │  Redis: 拓扑快照 + 性能时序 + 事件流 + 盯梢者唤醒               │
+        │  MySQL: 持久化历史数据 + 变更记录 + 分区自动清理                 │
+        │  Stalker Manager: 事件路由 + 级联唤醒 + 防惊群                  │
+        └───────────────────────────────────────────────────────────────┘
+                                        │
+        ┌───────────────────────────────┴───────────────────────────────┐
+        │                   交互层 (Interaction Layer)                    │
+        │                                                                │
+        │  北向 API (north_api.py): REST/gRPC 流表下发入口                │
+        │  前端系统: Web 拓扑可视化 + 性能监控 + 流表管理                  │
+        └───────────────────────────────────────────────────────────────┘
+```
+
+### 线程拓扑（当前 Phase 2.5 已实现）
+
+| # | 线程名 | 类型 | 职责 |
+|---|--------|------|------|
+| 1 | `MainThread` (eventlet) | Ryu 主线程 | PacketIn 处理、发送 FlowMod/LLDP Drain |
+| 2 | `Dispatcher` | threading | 从 RingBuffer pop → hash → 非阻塞 put 到 Worker |
+| 3 | `Worker-0` | threading | input_queue.get → 安全过滤 → 解析 → fan-out |
+| 4 | `Worker-1` | threading | 同上 |
+| 5 | `Worker-2` | threading | 同上 |
+| 6 | `LLDPCollector` | threading | 每 5s 构造 LLDP → downlink_queue |
+| 7 | `TopologyProcessor` | threading | 防抖窗口检查 + 超时扫描 (500ms 间隔) |
+| 8 | `TopologyConsumer` | threading | 从所有 topo_east_queue 消费 → processor |
+| 9 | `PerfMonitor` | threading | 从所有 perf_east_queue 消费 → 计算指标 |
+| 10 | `LLDP Drain Timer` | eventlet (green thread) | 每 100ms 排空 downlink_queue |
+
+**共 10 个并发执行单元**，其中 9 个 OS 线程 + 1 个 eventlet green thread。
 
 ---
 
-## 2. 主控制器模块
+## 2. 主控制器模块 ✅
+
+> **实现文件**: [`controllers/app.py`](../controllers/app.py), [`controllers/transparent_proxy.py`](../controllers/transparent_proxy.py), [`controllers/security_filter.py`](../controllers/security_filter.py)
 
 ### ✅ 保留的创新设计
 
-| 设计点 | 说明 |
-|--------|------|
-| **纯透传** | 主控不做任何业务处理，仅作为数据通道 |
-| **东西北三向接口** | 东向=采集数据出口，西向=首包数据出口，北向=流表下发入口 |
-| **metadata 分类** | 通过流表预设 metadata 字段区分东/西向消息 |
+| 设计点 | 说明 | 实现状态 |
+|--------|------|---------|
+| **纯透传** | 主控不做任何业务处理，仅作为数据通道 | ✅ 已实现 |
+| **metadata 分类** | 通过 metadata 字段区分东/西向消息 | ✅ 已实现 |
+| **东西双向出口** | 东向→Ring Buffer(削峰)，西向→快通道(直通) | ✅ 已实现 |
+| **前置安全过滤** | 包大小超限在主控层快速拒绝，避免进入消息队列 | ✅ 已实现 |
 
 ### ❌ 去除的内容
 
 | 去除项 | 原因 | 替代方案 |
 |--------|------|---------|
-| DMA/vhost-user 直通 | 依赖特殊硬件（SR-IOV 网卡 + DPDK），Mininet/普通服务器不可实现 | 改为标准 `collections.deque` Ring Buffer，软件层面零拷贝通过引用传递 |
-| 安全过滤在主控串行 | 违背纯透传原则，主控应不做任何解析 | 安全过滤下沉到三个处理窗口，各自独立执行 |
-| "0.05ms DMA 拷贝" 性能声明 | 硬件依赖不可复现 | 改为定性描述"低延迟透传"，不做定量承诺 |
+| DMA/vhost-user 直通 | 依赖特殊硬件（SR-IOV + DPDK），Mininet 不可实现 | 标准 `collections.deque` Ring Buffer，软件层零拷贝通过引用传递 |
+| metadata 由流表模块预设 | 流表模块未实现（Phase 4），且默认流表规则无 metadata 字段 | **当前实现**：LLDPCollector 在 PacketOut 中通过 `OFPActionSetField(metadata=1)` 打标签，交换机收到后上送 PacketIn 携带 metadata=1 |
+| 北向 gRPC 接口 | 过度设计，Phase 2 阶段不需要 | 预留 `north_api.py` 占位文件 |
 
-### 🔧 细化的内容
+### 🔧 实际实现细节
 
-**metadata 标签机制明确化：**
-
-```
-metadata 标签由「流表管理模块」在下发初始流表时预设：
-  - 流表规则 A: match=LLDP(ethertype=0x88CC) → metadata=1, output=CONTROLLER
-  - 流表规则 B: match=ARP  → metadata=2, output=CONTROLLER
-  - 流表规则 C: match=IP   → metadata=2, output=CONTROLLER
-  - 默认流表: match=*      → metadata=2, output=CONTROLLER
-
-交换机在匹配流表时自动写入 metadata 字段，主控仅读取 OpenFlow 消息头中的 metadata 字段（无需深度解析数据包）：
-  - metadata == 1 → 东向出口（采集数据）
-  - metadata == 2 → 西向出口（首包触发）
-```
-
-### 📐 接口定义
+**PacketIn 处理流程**（[`app.py:142-176`](../controllers/app.py:142)）：
 
 ```python
-class SDNController(ryu.base.app_manager.RyuApp):
-    """
-    纯透传主控制器
-    - 东向出口: self.east_ring (SPSC Ring Buffer)
-    - 西向出口: self.dispatcher (直接调用)
-    - 北向入口: self.north_handler (接收 FlowMod)
-    """
+def packet_in_handler(self, ev):
+    msg = ev.msg
 
+    # 1. 前置安全过滤（包大小 > 65535 → 丢弃）
+    if not self.security_filter.filter(msg):
+        return
+
+    # 2. metadata 分类决定方向
+    msg_type = self.proxy.classify_by_metadata(msg)
+
+    if msg_type == TransparentProxy.TYPE_EAST:    # metadata == 1
+        self.ring_buffer.push(msg)                 # 东向：Ring Buffer 削峰
+    else:                                          # metadata != 1
+        self.dispatcher.dispatch(msg)              # 西向：快通道直通
+```
+
+**metadata 标签来源**（[`collector.py:153-154`](../modules/topology/collector.py:153)）：
+
+```python
+# LLDPCollector 在构造 PacketOut 时打 metadata=1 标签
+actions = [
+    parser.OFPActionSetField(metadata=1),    # ← 标签在此设置
+    parser.OFPActionOutput(port_no),
+]
+```
+
+交换机收到此 PacketOut 后从指定端口发出 LLDP 帧，邻居交换机收到后上送 PacketIn。**由于 OpenFlow 流水线会保留 metadata 字段**，邻居交换机上送的 PacketIn 携带 metadata=1 → 被 TransparentProxy 识别为 TYPE_EAST。
+
+**默认流表**（[`app.py:122-131`](../controllers/app.py:122)）：
+
+```python
+# 初始流表：所有包上送控制器（无 metadata 预设）
+match = parser.OFPMatch()  # 空匹配 = 匹配所有
+actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+```
+
+注意：默认流表**不预设 metadata**，因此普通 ARP/IP 包的 metadata 为默认值 0 → `!= 1` → TYPE_WEST。
+
+### 📐 初始化流程
+
+```python
+class SDNController(RyuApp):
     def __init__(self):
-        self.east_ring = RingBuffer(capacity=4096)   # SPSC 环形缓冲区
-        self.dispatcher = Dispatcher(num_workers=3)   # 三窗口分发器
-        self.north_handler = NorthBoundHandler(self)  # 北向 RPC 入口
+        # 前置安全过滤
+        self.security_filter = SecurityFilter(self.logger)
 
-    def packet_in_handler(self, ev):
-        """所有 PacketIn 的消息处理入口"""
-        msg = ev.msg
-        # 仅读取 metadata 字段（OpenFlow 消息头字段，零深度解析）
-        metadata = msg.match.get('metadata', 0)
+        # 透传代理（元数据分类）
+        self.proxy = TransparentProxy(self)
 
-        if metadata == 1:
-            self.east_ring.push(msg)       # 东向：投入 Ring Buffer
-        else:
-            self.dispatcher.dispatch(msg)  # 西向：直接分发到处理窗口
+        # SPSC Ring Buffer (capacity=4096)
+        self.ring_buffer = RingBuffer(capacity=4096, name="EastRingBuffer")
+
+        # Hash Dispatcher (3 workers)
+        self.dispatcher = Dispatcher(ring_buffer=self.ring_buffer, num_workers=3)
+
+        # 注入日志器 → 启动 Dispatcher + 3 Workers 线程
+        for worker in self.dispatcher.workers:
+            worker.set_logger(self.logger)
+        self.dispatcher.start()
+
+        # 拓扑发现
+        self.lldp_collector = LLDPCollector(logger=self.logger)
+        self.topology_processor = TopologyProcessor(logger=self.logger)
+        self.topology_processor.start()
+        self._start_lldp_drain_timer()      # eventlet 100ms 定时器
+        self._start_topology_consumer()      # 拓扑消费线程
+        self.lldp_collector.start()          # LLDP 采集线程
+
+        # 性能检测
+        perf_queues = self.get_perf_east_queues()
+        self.perf_monitor = PerformanceMonitor(perf_queues, logger=self.logger)
+        self.perf_monitor.start()
 ```
 
-### 📦 北向接口
+### 公共接口
 
 ```python
-class NorthBoundHandler:
-    """
-    北向入口：接收流表管理模块的 FlowMod 请求
-    通过 gRPC 暴露接口，主控仅做序列化转发
-    """
-    def receive_flow_mods(self, flow_mods: List[FlowModRequest]) -> bool:
-        """批量接收 FlowMod，下发到对应交换机，返回是否全部成功"""
-        for fm in flow_mods:
-            datapath = self._get_datapath(fm.dpid)
-            datapath.send_msg(fm.to_openflow())
-        return True
+def get_topo_east_queues(self):   # → [Queue, Queue, Queue]  拓扑发现消费
+def get_perf_east_queues(self):   # → [Queue, Queue, Queue]  性能检测消费
+def get_west_queues(self):        # → [Queue, Queue, Queue]  路由管理消费 (Phase 4)
+def get_topology(self) -> dict:   # → 当前拓扑图谱
+def get_performance(self) -> dict:# → 最新性能指标 + 拥堵等级
 ```
 
 ---
 
-## 3. 消息队列模块
+## 3. 消息队列模块 ✅
+
+> **实现文件**: [`modules/message_queue/ring_buffer.py`](../modules/message_queue/ring_buffer.py), [`modules/message_queue/dispatcher.py`](../modules/message_queue/dispatcher.py), [`modules/message_queue/worker.py`](../modules/message_queue/worker.py)
 
 ### ✅ 保留的创新设计
 
-| 设计点 | 说明 |
-|--------|------|
-| **三窗口并行处理** | 三个功能完全一致的处理窗口，实现并发处理 |
-| **降级队列概念** | 低流量时避免队列开销，高流量时削峰填谷 |
-| **窗口浅解析 + 数据结构化** | 窗口对消息做浅层分类和标准化封装 |
-| **东/西两条业务队列** | 东向→拓扑队列+性能队列，西向→首包队列 |
+| 设计点 | 说明 | 实现状态 |
+|--------|------|---------|
+| **三窗口并行处理** | 3 个功能完全一致的 Worker，OS 线程并行 | ✅ 已实现 |
+| **SPSC Ring Buffer** | 东向削峰填谷，满时丢弃最旧 | ✅ 已实现 |
+| **Hash 分发保序** | hash(dpid, in_port) 保证同端口包顺序 | ✅ 已实现 |
+| **浅解析 + 数据结构化** | Worker 做 L2 浅解析 + 封装 StructuredMessage | ✅ 已实现 |
+| **Fan-out 三条输出队列** | LLDP→topo_east, IP→perf_east, ARP/OTHER→west | ✅ 已实现 |
+| **两层安全过滤** | 前置(主控: 包大小) + 深度(Worker: ethertype/IP头) | ✅ 已实现 |
 
 ### ❌ 去除的内容
 
 | 去除项 | 原因 | 替代方案 |
 |--------|------|---------|
-| 三窗口类 RAFT 协议 | 单机场景下不存在分布式共识问题，RAFT 是严重过度设计 | 改用 Redis Stream 持久化 + Consumer ACK |
-| "无锁直接写入"宣称 | 三个窗口写入同一条队列必须有锁（隐藏在 Python `queue.Queue` 内部） | 如实描述为"线程安全队列" |
-| LLDP 时延计算在窗口层 | 属于性能检测模块职责，不应放在消息队列层 | 移到性能检测 Handler |
+| 三窗口类 RAFT 协议 | 单机场景不存在分布式共识问题 | 无需替代（单进程内线程间通信） |
+| 降级队列动态切换 | 阈值震荡问题，且 deque 操作纳秒级 | 固定使用 Ring Buffer，低流量时几乎无等待 |
+| LLDP 时延计算在窗口层 | 属于性能检测模块职责 | 已移到 PerformanceMonitor |
 
-### 🔧 细化的内容
+### 🔧 Ring Buffer 实现
 
-**降级队列实现细节：**
+```python
+class RingBuffer:
+    """
+    SPSC 环形缓冲区（collections.deque 实现）
 
+    生产者: 主控线程 (push)
+    消费者: Dispatcher 线程 (pop)
+    容量:   4096 (可配置)
+    满策略: 丢弃最旧消息 (popleft + append)，记录 total_dropped
+
+    同步机制:
+      - push 端: threading.Lock (仅保护 deque 写入)
+      - pop 端:  Condition (阻塞等待新数据)
+    """
+    def push(self, item) -> bool:
+        with self._lock:
+            if len(self._deque) >= self._capacity:
+                self._deque.popleft()       # 丢弃最旧
+                self.total_dropped += 1
+                dropped = True
+            self._deque.append(item)
+            self.total_pushed += 1
+        with self._not_empty:
+            self._not_empty.notify()        # 唤醒消费者
+        return not dropped
+
+    def pop(self, timeout=None):
+        with self._not_empty:
+            while len(self._deque) == 0:
+                if not self._not_empty.wait(timeout):
+                    return None             # 超时返回 None
+            item = self._deque.popleft()
+            self.total_popped += 1
+            return item
 ```
-降级队列设计（保留概念，明确实现）：
 
-方案：固定使用 SPSC Ring Buffer，始终走队列路径
-- 原因：Python collections.deque 入队/出队开销在纳秒级
-- 低流量时 Ring Buffer 几乎无等待，延迟可忽略
-- 不需要"判断流量大小→动态切换"的复杂逻辑
-- 避免了阈值震荡问题
-- 保留了削峰填谷的核心价值
-
-Ring Buffer 实现：
-  - 容量: 4096 条消息（可配置）
-  - 满时策略: 丢弃最旧消息（FIFO drop），记录 metrics
-  - 实现: collections.deque(maxlen=4096) + threading.Lock（仅 push 端加锁）
-```
-
-**Dispatcher 分发机制：**
+### 🔧 Dispatcher 分发机制
 
 ```python
 class Dispatcher:
     """
-    单线程 Hash 分发器
-    - 对每个 PacketIn 的 (dpid, in_port) 做 hash
-    - 分发到固定窗口，同一交换机同一端口的消息到同一窗口
-    - 避免同一流的多包分散到不同窗口导致的乱序
+    多线程 Hash 分发器
+
+    线程拓扑: 1 Dispatcher 线程 + N Worker 线程
+
+    分发策略:
+      hash(dpid, in_port) % num_workers
+      → 同一交换机同一端口的包始终进入同一 Worker (保序)
+
+    Dispatcher 线程职责 (极轻量):
+      RingBuffer.pop() → hash → Worker[N].input_queue.put(msg)
+      不执行任何 CPU 密集型操作，延迟极低
+
+    西向快通道:
+      dispatch(msg) 直接跳过 RingBuffer
+      → 非阻塞 put 到 Worker input_queue
     """
-    def __init__(self, num_workers=3):
-        self.workers = [Worker(i) for i in range(num_workers)]
-
-    def dispatch(self, msg):
-        key = (msg.datapath.id, msg.match.get('in_port', 0))
-        idx = hash(key) % len(self.workers)
-        self.workers[idx].handle(msg)
+    def _dispatch_to_worker(self, msg, via_east: bool):
+        dpid = msg.datapath.id
+        in_port = msg.match.get('in_port', 0) if msg.match else 0
+        idx = hash((dpid, in_port)) % self._num_workers
+        worker = self._workers[idx]
+        # 非阻塞 put：Dispatcher 不等待 Worker 处理完成
+        worker.input_queue.put(msg, timeout=0.05)
 ```
 
-**浅解析边界定义：**
-
-```
-浅解析：仅解析以下内容——
-  1. OpenFlow 消息头: metadata 字段（分类东/西）
-  2. 以太网帧头: ethertype（识别 ARP/IP/LLDP）
-  3. 不做任何 L3+ 解析
-
-深解析（由下游 Handler 执行）：
-  - LLDP TLV 解析、时间戳提取（→ 性能检测 Handler）
-  - IP 五元组提取（→ 首包处理 Handler）
-  - ARP 载荷解析（→ 路由计算模块 ARP 处理机）
-```
-
-**处理窗口功能：**
+### 🔧 Worker 处理窗口
 
 ```python
 class Worker:
     """
-    单个处理窗口，功能：
-    1. 安全过滤（独立执行，不影响其他窗口）
-    2. 浅解析分类（仅看 ethertype）
-    3. 数据结构化（封装为标准 Message 对象）
-    4. 写入对应模块队列
-    """
-    def __init__(self, worker_id):
-        self.filter = SecurityFilter()
-        self.east_queue = queue.Queue()  # → 拓扑/性能模块
-        self.west_queue = queue.Queue()  # → 路由管理模块
+    处理窗口 — 多线程 Actor 模式
 
-    def handle(self, msg):
-        if not self.filter.check(msg):
-            return
-        packet_type = self._classify(msg)  # 浅解析
-        structured = Message(msg, packet_type)
-        if packet_type in (TYPE_LLDP, TYPE_STATS):
-            self.east_queue.put(structured)
-        else:
-            self.west_queue.put(structured)
+    输入:  input_queue (Queue, maxsize=10000)
+    输出:  topo_east_queue  → LLDP → TopologyProcessor
+           perf_east_queue  → IP   → PerformanceMonitor
+           west_queue       → ARP/OTHER → RouteManager (Phase 4)
+
+    处理流程:
+      1. SecurityFilter.check(raw_data)
+         - 包大小 > 65535 → 丢弃
+         - 帧长 < 14B → 丢弃
+         - ethertype 不在已知范围 → 放行(记录日志)但返回 ethertype
+         - IP 头长度 < 20 → 丢弃
+      2. 浅解析分类 (复用 check() 返回的 ethertype):
+         - 0x88CC → LLDP
+         - 0x0806 → ARP
+         - 0x0800/0x86DD → IP
+         - 其他 → OTHER
+      3. 封装 StructuredMessage(msg_type, dpid, in_port, data, timestamp)
+      4. Fan-out 写入对应输出队列
+
+    满队列策略:
+      队列满 → 丢弃最旧消息 → 放入新消息
+    """
+```
+
+### 消息流向全景
+
+```
+PacketIn
+  │
+  ├─ SecurityFilter(前置): len(data) > 65535? → 丢弃
+  │
+  ├─ TransparentProxy: metadata==1?
+  │
+  ├─ YES (东向: LLDP 回升包 / IP 采集包)
+  │   └─ RingBuffer.push() ──→ Dispatcher.pop() ──→ Worker[N].input_queue
+  │
+  └─ NO  (西向: ARP/IP 首包)
+      └─ Dispatcher.dispatch() ──────────────────→ Worker[N].input_queue
+
+Worker 线程处理:
+  SecurityFilter(深度) → 浅解析(ethertype) → StructuredMessage
+    ├─ LLDP      → topo_east_queue  → TopologyConsumer 线程 → TopologyProcessor
+    ├─ IP        → perf_east_queue  → PerfMonitor 线程 → EWMADetector
+    └─ ARP/OTHER → west_queue       → [Phase 4: RouteManager]
 ```
 
 ---
 
-## 4. 拓扑发现模块
+## 4. 拓扑发现模块 ✅
+
+> **实现文件**: [`modules/topology/collector.py`](../modules/topology/collector.py), [`modules/topology/processor.py`](../modules/topology/processor.py), [`modules/topology/validator.py`](../modules/topology/validator.py), [`modules/topology/lldp_utils.py`](../modules/topology/lldp_utils.py)
 
 ### ✅ 保留的创新设计
 
-| 设计点 | 说明 |
-|--------|------|
-| **采集/处理分离** | 采集部分（LLDP 生成）和处理部分（拓扑绘制）独立 |
-| **metadata 标签** | 采集 LLDP 时预设 metadata=1，主控无需解析即可路由到东向 |
-| **Redis 单图 + version** | Redis 只存一张全局拓扑图，version 单调递增 |
-| **超时闹钟批量写入** | 防抖窗口收集变更，批量写入 |
-| **LLDP 超时检测** | 连续 3 次（90 秒）未收到 LLDP → 判定链路断开 |
-| **MySQL 变更记录** | 持久化所有拓扑变更，30 天自动清理 |
+| 设计点 | 说明 | 实现状态 |
+|--------|------|---------|
+| **采集/处理分离** | Collector(LLDP生成) + Processor(拓扑绘制) 独立线程 | ✅ 已实现 |
+| **metadata 标签** | Collector 下发 PacketOut 时 `OFPActionSetField(metadata=1)` | ✅ 已实现 |
+| **防抖窗口 + 上限** | 2s 基础窗口，5s 最大上限（防饥饿） | ✅ 已实现 |
+| **LLDP 超时检测** | 连续 90s 未收到 LLDP → 标记 DOWN | ✅ 已实现 |
+| **版本单调递增** | TopologyGraph.version 每次变更 +1 | ✅ 已实现 |
+| **Diff Engine** | 增量变更计算（ADD/DELETE/MODIFY） | ✅ 已实现 |
+| **LLDP 最小化校验** | ChassisID 已知性 + PortID 格式 + TTL 范围 | ✅ 已实现 |
 
 ### ❌ 去除的内容
 
 | 去除项 | 原因 | 替代方案 |
 |--------|------|---------|
-| "百分百信任采集上来的所有包" | 安全漏洞，LLDP 伪造攻击可破坏拓扑 | 增加最小化校验（ChassisID/PortID 一致性检查） |
+| "百分百信任采集上来的所有包" | 安全漏洞，LLDP 伪造可破坏拓扑 | LLDPValidator：未知 ChassisID → is_valid=False |
 
-### 🔧 细化的内容
+### 🔧 实际实现细节
 
-**防抖窗口 + 上限机制（解决防抖饥饿）：**
+**LLDP 采集器**（[`collector.py`](../modules/topology/collector.py)）：
 
-```
-超时闹钟设计：
-  - 基础防抖窗口: 2 秒
-  - 最大防抖上限: 5 秒（防止防抖饥饿）
-  - 窗口内收到变更 → 重置 2 秒窗口
-  - 如果从第一次变更起已过 5 秒 → 强制写入，清空窗口
+```python
+class LLDPCollector:
+    """
+    独立线程运行，每 5s 遍历交换机生成 LLDP
 
-伪代码：
-  first_change_time = None
+    下行队列模式（线程安全）:
+      1. Collector 线程: 构造 PacketOut → append 到 downlink_queue
+      2. 主控线程(eventlet): 每 100ms 排空 downlink_queue → send_msg()
 
-  on_link_change(event):
-      cache.add(event)
-      if first_change_time is None:
-          first_change_time = now()
-          schedule_flush(after=2s)
-      elif now() - first_change_time > 5s:
-          force_flush()  # 防抖饥饿保护
-      else:
-          reschedule_flush(after=2s)
+    原因: OpenFlow send_msg() 必须在 eventlet 主线程中调用
+    """
+    LLDP_INTERVAL = 5.0   # 每 5 秒发送一轮
 
-  force_flush():
-      diff = DiffEngine.compute(cache, redis_snapshot)
-      redis.pipeline() \
-          .set('topology:graph:current', diff.new_graph) \
-          .incr('topology:graph:version') \
-          .xadd('topology:events', diff.events) \
-          .execute()
-      mysql.insert_async(diff.changelog)
-      cache.clear()
-```
-
-**增量 Patch 替代全量写：**
-
-```
-Redis 存储结构：
-  topology:graph:current     → JSON (完整拓扑，用于新模块初始化)
-  topology:graph:version     → INT  (单调递增版本号)
-  topology:link:{link_id}    → HASH (单链路详情，支持增量更新)
-  topology:events            → STREAM (变更事件流, MAXLEN≈10000)
-
-变更发生时：
-  1. Diff Engine 计算增量变更 (add/del/modify)
-  2. 更新受影响的 topology:link:{link_id}
-  3. 更新 topology:graph:current (全量快照)
-  4. version += 1
-  5. XADD topology:events {event_json}
-  6. 异步写 MySQL topology_changelog
+    def _send_lldp_for_switch(self, sw: SwitchHandle):
+        for port_no in ports:
+            lldp_frame = build_lldp_frame(chassis_mac, port_id_str)
+            actions = [
+                parser.OFPActionSetField(metadata=1),  # ← 东向标签
+                parser.OFPActionOutput(port_no),
+            ]
+            out = parser.OFPPacketOut(
+                datapath=dp,
+                buffer_id=ofproto.OFP_NO_BUFFER,
+                in_port=ofproto.OFPP_CONTROLLER,
+                actions=actions,
+                data=lldp_frame,
+            )
+            with self._lock:
+                self.downlink_queue.append((dp, out))
 ```
 
-**最小化 LLDP 校验：**
+**拓扑处理器**（[`processor.py`](../modules/topology/processor.py)）：
+
+```python
+class TopologyProcessor:
+    """
+    拓扑处理器
+
+    入口: process_structured_message(structured_msg)
+      从 TopologyConsumer 线程接收 Worker 输出的 StructuredMessage
+
+    LLDP 解析流程:
+      1. parse_lldp_frame(data) → LLDPPacket
+      2. validator.validate(lldp_packet) → ValidationResult
+         - 未知 ChassisID → is_valid=False (拒绝)
+         - PortID 格式异常 → warning (放行)
+         - TTL 异常 → warning (放行)
+      3. 提取拓扑信息:
+         src_dpid = msg.dpid         (收到 LLDP 的交换机)
+         src_port = msg.in_port      (收到 LLDP 的端口)
+         dst_dpid = lldp_packet.src_dpid  (发送 LLDP 的交换机)
+         dst_port = lldp_packet.src_port  (发送 LLDP 的端口)
+      4. graph.upsert_link(dst_dpid, dst_port, src_dpid, src_port)
+         → 新链路 → LinkEvent(ADD) → 放入防抖窗口
+
+    主循环 (500ms 间隔):
+      1. debounce.should_flush()?
+         - 基础窗口 2s: 最后事件距今超过 2s → flush
+         - 最大上限 5s: 首次事件距今超过 5s → 强制 flush (防饥饿)
+      2. graph.mark_stale_links(timeout=90s)
+         - last_seen < now - 90s → LinkEvent(DELETE)
+      3. _apply_events() → pending_events 队列 + 日志输出
+    """
+    LINK_TIMEOUT = 90.0          # LLDP 超时
+    TIMEOUT_SCAN_INTERVAL = 10.0 # 超时扫描间隔
+```
+
+**LLDP 校验器**（[`validator.py`](../modules/topology/validator.py)）：
 
 ```python
 class LLDPValidator:
     """
-    轻量级 LLDP 校验（不显著影响性能）：
-    1. 检查 ChassisID 是否在已知设备列表中
-    2. 检查 PortID 格式是否合法
-    3. 不匹配 → 记录告警日志，但不丢弃（可用性优先）
+    校验策略:
+      1. ChassisID 必须在已知设备列表中 → 不在则 is_valid=False (安全策略)
+      2. PortID 格式: 纯数字 / sN-ethM / 命名格式
+      3. TTL: 0 < TTL ≤ 65535
+
+    设计原则:
+      - 未知设备 → 拒绝（防止 LLDP 伪造攻击）
+      - 格式轻微异常 → 放行 + 记录告警（可用性优先）
     """
-    def validate(self, lldp_packet):
-        chassis_id = lldp_packet.chassis_id
-        port_id = lldp_packet.port_id
-
-        warnings = []
-        if chassis_id not in self.known_devices:
-            warnings.append(f"Unknown ChassisID: {chassis_id}")
-        if not self._valid_port_format(port_id):
-            warnings.append(f"Invalid PortID format: {port_id}")
-
-        return ValidationResult(
-            is_valid=True,  # 始终放行
-            warnings=warnings
-        )
 ```
 
-**双写一致性策略：**
-
-```
-写入策略：
-  1. 主写入: Redis（同步，必须成功）─ 失败则重试 3 次
-  2. 副写入: MySQL（异步，允许延迟）─ 失败则写入本地死信日志
-  3. 后台补偿任务: 每 10 分钟扫描死信日志，重放到 MySQL
-  4. 死信日志过期: 保留 24 小时，超时丢弃并告警
-```
-
-### 📐 接口定义
+**拓扑图谱数据结构**：
 
 ```python
-class TopologyDiscovery:
-    """
-    拓扑发现模块
-    前向接口: 消费东向队列 → topology_queue
-    后向出口: 写入 Redis + MySQL
-    """
+topology_graph = {
+    "switches": {
+        str(dpid): {
+            "dpid": int,
+            "mac": "xx:xx:xx:xx:xx:xx",
+            "ports": [],
+        }
+    },
+    "links": {
+        (src_dpid, src_port, dst_dpid, dst_port): {
+            "src_dpid": int, "src_port": int,
+            "dst_dpid": int, "dst_port": int,
+            "last_seen": float,        # 最后收到 LLDP 的时间戳
+            "status": "UP" | "DOWN",
+        }
+    },
+    "version": 0,    # 单调递增
+    "updated_at": float,
+}
+```
 
-    def __init__(self, topology_queue, redis_client, mysql_pool):
-        self.queue = topology_queue
-        self.redis = redis_client
-        self.mysql = mysql_pool
-        self.collector = LLDPCollector()
-        self.processor = TopologyProcessor(debouce_window=2.0, max_window=5.0)
-        self.diff_engine = DiffEngine()
-        self.validator = LLDPValidator()
+### 📐 规划增强（Phase 3+）
 
-    def run(self):
-        """主循环：消费队列，处理 LLDP 消息"""
-        while True:
-            msg = self.queue.get()
-            if not self.validator.validate(msg.lldp_data).has_critical():
-                event = self.collector.parse(msg)
-                self.processor.on_event(event)
+当前拓扑数据仅存储在内存 (`TopologyGraph`)。Phase 3 接入 Redis 后：
 
-    def get_current_topology(self) -> dict:
-        """获取当前拓扑图（从 Redis 缓存读取）"""
-        return json.loads(self.redis.get('topology:graph:current'))
+```
+Redis 存储结构：
+  topology:graph:current     → STRING  完整拓扑 JSON（用于新模块初始化）
+  topology:graph:version     → INT     单调递增版本号
+  topology:link:{link_id}    → HASH    单链路详情
+  topology:events            → STREAM  变更事件流 (MAXLEN≈10000)
+
+变更发生时（Diff Engine）：
+  1. 计算增量变更 (add/del/modify)
+  2. 更新受影响的 topology:link:{link_id}
+  3. 更新 topology:graph:current
+  4. version += 1
+  5. XADD topology:events {event_json}
+  6. 异步写 MySQL topology_changelog
+
+双写一致性：
+  - 主写入: Redis（同步，必须成功）─ 失败则重试 3 次
+  - 副写入: MySQL（异步，允许延迟）─ 失败则写入本地死信日志
+  - 后台补偿: 每 10 分钟扫描死信日志，重放到 MySQL
 ```
 
 ---
 
-## 5. 性能检测模块
+## 5. 性能检测模块 ✅
+
+> **实现文件**: [`modules/performance/monitor.py`](../modules/performance/monitor.py), [`modules/performance/detector.py`](../modules/performance/detector.py), [`modules/performance/metrics.py`](../modules/performance/metrics.py), [`modules/performance/sampler.py`](../modules/performance/sampler.py)
 
 ### ✅ 保留的创新设计
 
-| 设计点 | 说明 |
-|--------|------|
-| **四级性能指标** | 吞吐量、时延、抖动、丢包率 |
-| **多级采样粒度** | Flow-level / Aggregate-level |
-| **is_congested 标红** | 超阈值标记，触发盯梢者 |
-| **动态采样频率** | 不同 SLA 不同频率 |
-| **PULL 模式主动采样** | STATS_REQUEST 轮询 |
+| 设计点 | 说明 | 实现状态 |
+|--------|------|---------|
+| **四级性能指标** | 吞吐量(bps)、时延(ms)、抖动(ms)、丢包率(%) | ✅ 已实现 |
+| **EWMA 动态阈值** | α=0.2 平滑基线，偏差率判定拥堵 | ✅ 已实现 |
+| **拥堵等级 0-3** | 正常/轻度/中度/重度，含硬保底 | ✅ 已实现 |
+| **自适应采样调度** | 根据利用率动态调整采样间隔 | ✅ 已实现 |
+| **ICMP Echo 配对** | Request/Reply 时间差估算 RTT | ✅ 已实现 |
 
 ### ❌ 去除的内容
 
 | 去除项 | 原因 | 替代方案 |
 |--------|------|---------|
-| 静态阈值 `delay > 40ms` | 不同链路带宽/场景差异大，一刀切不准确 | EWMA 动态阈值 |
-| 布尔标红（只有是/否） | 无法表达拥堵程度 | 拥堵等级 0-3 |
+| 静态阈值 `delay > 40ms` | 不同链路差异大，一刀切不准确 | EWMA 动态阈值 + 标准差判定 |
+| 布尔标红（只有是/否） | 无法表达拥堵程度 | 拥堵等级 0-3（4 级） |
 
-### 🔧 细化的内容
+### 🔧 实际实现细节
 
-**EWMA 动态阈值：**
-
-```
-EWMA 算法：
-  baseline(t) = α × value(t) + (1-α) × baseline(t-1)
-  其中 α = 0.2（平滑因子，可配置）
-
-判定条件：
-  偏差率 = |value - baseline| / baseline
-  deviation > 3 × std_deviation → congestion_level = 3（重度）
-  deviation > 2 × std_deviation → congestion_level = 2（中度）
-  deviation > 1 × std_deviation → congestion_level = 1（轻度）
-  否则                          → congestion_level = 0（正常）
-
-额外硬上限（保底）：
-  delay > 500ms  → 强制 congestion_level = 3
-  loss  > 10%    → 强制 congestion_level = 3
-```
-
-**拥堵等级与策略联动：**
-
-| 等级 | 含义 | 路由动作 | 限速动作 |
-|------|------|---------|---------|
-| 0 | 正常 | 无变化 | 无变化 |
-| 1 | 轻度 | 标记链路效用值×0.8 | Meter 限速降至 80% |
-| 2 | 中度 | 标记链路效用值×0.5 | Meter 限速降至 50%，Queue 限速启用 |
-| 3 | 重度 | 标记链路效用值×0.2 | Meter 限速降至 20%，Queue 严格限速；P0 立即切备 |
-
-**自适应采样频率：**
-
-```python
-class AdaptiveScheduler:
-    """
-    自适应采样调度器
-    - 基础频率: 500ms
-    - utilization > 70% → 加速到 200ms
-    - utilization > 90% → 加速到 100ms
-    - utilization < 30% → 减速到 2s
-    - 最小间隔: 100ms（防止过度采样）
-    - 最大间隔: 5s（防止漏检）
-    """
-    def next_interval(self, link_utilization: float) -> float:
-        if link_utilization > 0.90:
-            return 0.1
-        elif link_utilization > 0.70:
-            return 0.2
-        elif link_utilization < 0.30:
-            return 2.0
-        return 0.5
-```
-
-**批量 STATS_REQUEST 优化：**
-
-```
-同一交换机的多个端口/流表统计请求合并为一次 OFPT_MULTIPART_REQUEST：
-  - OFPMP_PORT_STATS + OFPMP_FLOW_STATS 合并请求
-  - 交换机一次回复包含所有统计数据
-  - 减少控制通道消息量 O(N_ports) → O(1)
-```
-
-### 📐 接口定义
+**性能监控器**（[`monitor.py`](../modules/performance/monitor.py)）：
 
 ```python
 class PerformanceMonitor:
     """
-    性能检测模块
-    前向接口: 消费东向队列 → perf_queue
-    后向出口: 写入 Redis Stream + Hash
+    独立线程运行，从所有 perf_east_queue 消费 IP 包
+
+    当前实现（Phase 2 简化策略）:
+      - 被动采集: 消费 Worker 输出的 IP 包
+      - 字节累积: record_packet(link_key, len(data)) → 吞吐量计算
+      - ICMP 配对: 解析 Echo Request/Reply → RTT 估算
+      - 丢包率: 当前返回 0.0（占位，Phase 3+ 从 STATS_REPLY 获取）
+
+    主循环 (100ms 间隔):
+      1. _consume_queues(): 非阻塞排空所有 perf_east_queue
+      2. 每 BASE_INTERVAL(0.5s): _calculate_and_update()
+         - 遍历活跃链路 → 计算四指标 → EWMA 判定拥堵等级
+      3. 每 ICMP_TIMEOUT(5s): _clean_stale_echo()
+         - 清理超过 5s 未收到 Reply 的 ICMP Request
     """
+```
 
-    def __init__(self, perf_queue, redis_client, mysql_pool):
-        self.queue = perf_queue
-        self.redis = redis_client
-        self.mysql = mysql_pool
-        self.scheduler = AdaptiveScheduler()
-        self.detector = EWMADetector(alpha=0.2, std_threshold=3.0)
+**EWMA 拥堵检测器**（[`detector.py`](../modules/performance/detector.py)）：
 
-    def run(self):
-        while True:
-            msg = self.queue.get()
-            metrics = self._extract_metrics(msg)
-            congestion_level = self.detector.evaluate(metrics)
+```python
+class EWMADetector:
+    """
+    EWMA 基线更新:
+      baseline(t) = α × value(t) + (1-α) × baseline(t-1)
+      α = 0.2
 
-            self.redis.pipeline() \
-                .xadd(f'perf:stream:{metrics.link_id}', {
-                    'throughput': metrics.throughput,
-                    'delay': metrics.delay,
-                    'jitter': metrics.jitter,
-                    'packet_loss': metrics.packet_loss,
-                    'congestion_level': congestion_level,
-                    'timestamp': metrics.timestamp
-                }) \
-                .hset(f'perf:latest:{metrics.link_id}', mapping={...}) \
-                .execute()
+    判定条件 (基于偏差率):
+      deviation = |value - baseline| / max(baseline, ε)
+      取时延偏差和丢包偏差的最大值
 
-    def _extract_metrics(self, msg) -> LinkMetrics:
-        """从 STATS_REPLY 提取四指标"""
-        return LinkMetrics(
-            link_id=msg.link_id,
-            throughput=self._calc_throughput(msg),
-            delay=self._calc_delay(msg),
-            jitter=self._calc_jitter(msg),
-            packet_loss=self._calc_loss(msg),
-            timestamp=time.time_ns() // 1_000_000
-        )
+      偏差率 > 3×std → congestion_level = 3 (重度)
+      偏差率 > 2×std → congestion_level = 2 (中度)
+      偏差率 > 1×std → congestion_level = 1 (轻度)
+      否则           → congestion_level = 0 (正常)
+
+    硬保底:
+      delay > 500ms  → 强制 level = 3
+      loss  > 10%    → 强制 level = 3
+
+    拥堵等级与策略联动 (Phase 4 起执行):
+      等级 0: 正常   — 无变化
+      等级 1: 轻度   — 标记链路效用值 ×0.8, Meter 降至 80%
+      等级 2: 中度   — 标记链路效用值 ×0.5, Meter 降至 50%, Queue 启用
+      等级 3: 重度   — 标记链路效用值 ×0.2, Meter 降至 20%, P0 立即切备
+    """
+```
+
+**四指标计算器**（[`metrics.py`](../modules/performance/metrics.py)）：
+
+```
+吞吐量: (bytes_accumulated × 8) / elapsed_seconds  (bps)
+        每次计算后重置计数器
+
+时延:   从最近 60s 的 RTT 采样取中位数
+
+抖动:   |delay_current - delay_previous|
+
+丢包率: 当前返回 0.0 (Phase 3+ 从 OFPT_PORT_STATS 提取精确值)
+```
+
+**自适应采样调度器**（[`sampler.py`](../modules/performance/sampler.py)）：
+
+```python
+class AdaptiveScheduler:
+    MIN_INTERVAL  = 0.1   # 100ms (最高频率)
+    MAX_INTERVAL  = 5.0   # 5s   (最低频率)
+    BASE_INTERVAL = 0.5   # 500ms (默认)
+
+    # 利用率阈值
+    utilization > 90% → 0.1s  (最高频)
+    utilization > 70% → 0.2s  (中高频)
+    utilization < 30% → 2.0s  (低频)
+    否则             → 0.5s  (默认)
 ```
 
 ---
 
-## 6. 分区数据库 + 盯梢者架构
+## 6. 分区数据库 + 盯梢者架构 🔧
+
+> **已实现文件**: [`storage/redis_client.py`](../storage/redis_client.py)
+>
+> **待实现**: [`modules/stalker/`](../modules/stalker/), MySQL 客户端
 
 ### ✅ 保留的创新设计
 
-| 设计点 | 说明 |
-|--------|------|
-| **数据库作为交互中心** | 替代主控制器成为模块交互中枢 |
-| **盯梢者架构** | Redis 键空间通知 + epoll 阻塞唤醒 |
-| **Redis 分区** | 拓扑区（一张图+version）、性能区（实时+历史） |
-| **MySQL 持久化** | 历史数据长期存储 |
-| **盯梢者阻塞监听** | 线程平时挂起，事件到达时内核唤醒 |
+| 设计点 | 说明 | 实现状态 |
+|--------|------|---------|
+| **数据库作为交互中心** | 替代主控制器成为模块交互中枢 | 🔧 Redis 连接已建立 |
+| **盯梢者架构** | Redis 键空间通知 + epoll 阻塞唤醒 | 📐 接口已定义 |
+| **Redis 分区** | 拓扑区 + 性能区（实时+历史） | 🔧 Key 规范已定义 |
+| **MySQL 持久化** | 历史数据长期存储 + 分区自动清理 | 📐 表结构已定义 |
 
 ### ❌ 去除的内容
 
 | 去除项 | 原因 | 替代方案 |
 |--------|------|---------|
-| "零拷贝共享内存读取" | Redis C/S 架构不支持，客户端必须经过 socket | 改为"epoll 唤醒后仅一次系统调用即可获取数据" |
-| BLPOP 和 PSUBSCRIBE 混用 | 两种模式语义不同，混用增加复杂度 | 统一使用 Redis Stream + Consumer Group |
+| "零拷贝共享内存读取" | Redis C/S 架构不支持 | epoll 唤醒后仅一次 socket 读取 |
+| BLPOP 和 PSUBSCRIBE 混用 | 语义不同，混用增加复杂度 | 统一 Redis Stream + Consumer Group |
 
-### 🔧 细化的内容
+### 🔧 当前已实现：Redis 客户端
 
-**Stalker Manager 防惊群：**
+```python
+class RedisClient:
+    """
+    Redis 连接池管理器
+    连接参数优先级: 构造函数 > 环境变量(.env) > 默认值(127.0.0.1:6379/0)
+
+    已实现:
+      - 连接池 (max_connections=10)
+      - 自动加载 .env 文件
+      - init_topology_keys(): 创建 Stream Consumer Group 'stalkers'
+      - ping(): 健康检查
+      - client 属性: 暴露原生 Redis 客户端
+    """
+```
+
+### 📐 待实现：Stalker Manager 防惊群
 
 ```python
 class StalkerManager:
     """
-    盯梢者统一管理器 - 解决惊群问题
+    盯梢者统一管理器 — 解决惊群问题
 
-    设计：
-    1. 维护盯梢者注册表：{event_type: [stalker_list]}
-    2. 事件到达时：级联唤醒而非同时唤醒
-       - 拓扑变更: 先唤醒路由管理 → 路由管理完成 → 再通知路由计算
-       - 性能告警: 先唤醒 Meter 限速 → 再唤醒队列限速（同一链路）
-    3. 不同业务模块的盯梢者监听不同的 Redis key/stream，互不干扰
+    设计:
+      1. 维护盯梢者注册表: {event_type: [stalker_list]}
+      2. 事件到达时级联唤醒而非同时唤醒:
+         - 拓扑变更: 先唤醒路由管理 → 路由计算
+         - 性能告警: 先唤醒 Meter 限速 → 队列限速（同一链路）
+      3. 不同业务模块监听不同的 Redis key/stream，互不干扰
+
+    Redis Stream 消费模式:
+      XREADGROUP GROUP stalkers consumer-{pid} BLOCK 0 STREAMS ... >
+      阻塞等待新消息，有消息时 epoll 唤醒 → 路由到对应 Stalker
     """
-
-    def __init__(self, redis_client):
-        self.redis = redis_client
-        self.registry = {}       # key_pattern → [stalker]
-        self.wake_chain = {}     # event_type → [stalker_sequence]
-
-    def register(self, key_pattern, stalker, wake_order=0):
-        """注册盯梢者：key 模式 + 唤醒顺序（0=最先唤醒）"""
-        pass
-
-    def start(self):
-        """启动主监听线程，统一消费 Redis Stream"""
-        while True:
-            # 使用 XREADGROUP 阻塞读取
-            events = self.redis.xreadgroup(
-                group_name='stalkers',
-                consumer_name=f'stalker-{os.getpid()}',
-                streams={f'perf:stream:{link_id}': '>'},
-                block=0,  # 阻塞等待
-                count=1
-            )
-            for stream, messages in events:
-                for msg_id, data in messages:
-                    self._route_event(stream, data)
-
-    def _route_event(self, stream, data):
-        stalkers = self.registry.get(stream, [])
-        # 按 wake_order 排序后逐一唤醒（级联而非并发）
-        for stalker in sorted(stalkers, key=lambda s: s.wake_order):
-            stalker.on_event(data)
 ```
 
-**盯梢者注册表（stalker:registry）：**
+### 📐 盯梢者注册表
 
-| 模块 | 监听 Key/Stream | 事件 | 唤醒顺序 |
-|------|---------------|------|---------|
+| 模块 | 监听 Key/Stream | 触发事件 | 唤醒顺序 |
+|------|----------------|---------|---------|
 | 路由管理 | `topology:events` | 拓扑变更 | 1（最先） |
 | 路由计算 | `topology:events` | 拓扑变更（等待路由管理完成） | 2（延迟 100ms） |
 | Meter 限速 | `perf:stream:{link_id}` | congestion_level ≥ 2 | 1（最先） |
-| 队列限速 | `perf:stream:{link_id}` | congestion_level ≥ 2 | 站趎（延迟 50ms） |
+| 队列限速 | `perf:stream:{link_id}` | congestion_level ≥ 2 | 2（延迟 50ms） |
 | 流量分类 | 定时器 | 每 5 分钟 | - |
 | 流量预测 | 定时器 | 短期: 5 分钟 / 长期: 1 小时 | - |
 
-**MySQL 分区清理策略：**
-
-```sql
--- 性能历史表：按天分区
-CREATE TABLE perf_history (
-    id BIGINT AUTO_INCREMENT,
-    link_id VARCHAR(64),
-    throughput DOUBLE,
-    delay DOUBLE,
-    jitter DOUBLE,
-    packet_loss DOUBLE,
-    congestion_level TINYINT,
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (id, timestamp)
-) PARTITION BY RANGE (TO_DAYS(timestamp)) (
-    PARTITION p_history VALUES LESS THAN (TO_DAYS('2026-01-01')),
-    -- 每日自动创建新分区
-);
-
--- 定时清理任务（cron: 每天凌晨 3:00）
--- DROP PARTITION 瞬间完成，不锁表
--- 保留策略: 90 天
-```
-
 ---
 
-## 7. QoS-KPS 路由决策
+## 7. QoS-KPS 路由决策 📐
+
+> **状态**: Phase 4 待实现
 
 ### ✅ 保留的创新设计
 
 | 设计点 | 说明 |
 |--------|------|
-| **KPS 粗筛 + QoS 效用值精算** | 双层路径选择：效率+精度 |
+| **KPS 粗筛 + QoS 效用值精算** | 双层路径选择：效率 + 精度 |
 | **P0 级双路径预批量下发** | 交换机同时持有主备流表，故障瞬间切换 |
-| **P1 级单路径 + 缓存备选** | 不下发备选，故障时批量下发缓存路径 |
+| **P1 级单路径 + 缓存备选** | 不下发备选，故障时下发缓存路径 |
 | **惩罚算法** | 对预测拥堵链路降权而非删除 |
 | **五业务差异化权重矩阵** | 不同业务对不同 QoS 指标的敏感度不同 |
 | **效用函数（带宽/时延/抖动/丢包）** | 四条独立的效用曲线 |
@@ -691,223 +734,92 @@ CREATE TABLE perf_history (
 
 | 去除项 | 原因 | 替代方案 |
 |--------|------|---------|
-| 实时拥堵直接删除链路 | 所有路径都拥堵时无路可走 | 改为大幅降权（×0.2），保留为最后选择 |
-| ~80 个独立参数的效用函数 | 参数量爆炸，无法手动调优 | 收敛为 3 Profile + 2 因子（~30 个参数） |
-| 百分比 Meter（未验证兼容性） | OFPMF_BAND_PERCENTAGE 不普适 | 改为绝对速率配置，前端转换 |
-| "大很多""大于一点点" | 模糊不可实现 | 明确定义为 20% / 10% 阈值 |
+| 实时拥堵直接删除链路 | 所有路径都拥堵时无路可走 | 大幅降权（×0.2），保留为最后选择 |
+| ~80 个独立参数的效用函数 | 参数量爆炸，无法手动调优 | 3 Profile + 2 因子（~30 个参数） |
+| 百分比 Meter（兼容性问题） | `OFPMF_BAND_PERCENTAGE` 不普适 | 绝对速率配置，前端转换 |
 
-### 🔧 细化的内容
-
-**KSP 改为 K=5：**
+### 📐 KSP 粗筛
 
 ```
-K=3 → K=5 的原因：
+K = 5 (Yen's 算法):
   - 复杂拓扑中 3 条可能遗漏最优路径
-  - K=5 仅在路径数足够时生效（不足 5 条则全部返回）
+  - 不足 5 条则全部返回
   - 路径不相交度约束：共享链路 ≤ 1 条
-  - K=5 的计算开销可控（Yen's 算法 O(K×V×(E+VlogV))，K=5 是合理的折中）
+  - 计算开销: O(K×V×(E+VlogV))，K=5 是合理折中
 ```
 
-**独立惩罚系数：**
+### 📐 QoS 效用值精算
 
 ```
-拥堵等级 L (1-3) 下各指标的惩罚公式：
+三大基础 Profile (定义 δ_b, δ_d, δ_j, δ_l 权重):
 
-  delay_penalty(l)    = base_delay    × (1 + k_d × l)     k_d = 0.5
-  jitter_penalty(l)   = base_jitter   × (1 + k_j × l)     k_j = 0.8  (抖动对拥堵最敏感)
-  loss_penalty(l)     = base_loss     × (1 + k_l × l)     k_l = 1.0  (丢包最严重)
-  throughput_penalty(l)= base_throughput / (1 + k_t × l)   k_t = 0.3  (吞吐量对拥堵最不敏感)
+  Profile A "实时类":    δ_b=0.20, δ_d=0.45, δ_j=0.25, δ_l=0.10  → 会话类
+  Profile B "流媒体类":  δ_b=0.55, δ_d=0.15, δ_j=0.10, δ_l=0.20  → 流媒体类
+  Profile C "批量类":    δ_b=0.40, δ_d=0.00, δ_j=0.00, δ_l=0.60  → 下载类、其他类
 
-原因：拥堵→丢包↑→抖动↑→时延↑→有效吞吐量↓，不同指标的恶化速度不同
-```
-
-**路由决策阈值明确化：**
-
-```
-路径切换阈值（在路由自调整阶段）：
-
-  新路径效用值 - 当前路径效用值
-    > 20%  → 立即切换（"大很多"）
-    > 10%  → 标记为下周期切换（"大于一点点"）
-    ≤ 10%  → 忽略，保持当前路径
-
-P1 级拥堵等待策略：
-
-  拥堵等级 3 → 不等待，立即切换到缓存的备选路径
-  拥堵等级 2 → 等待 500ms（给限速模块一次生效周期）
-  拥堵等级 1 → 等待 2s（观察限速效果）
-  拥堵等级 0 → 无需处理
-
-  （原 5 秒等待时间过长，TCP 重传超时仅 200ms）
-```
-
-**参数收敛方案：3 Profile + 2 因子：**
-
-```
-三大基础 Profile（每种 Profile 定义 {δ_b, δ_d, δ_j, δ_l} 权重 + 效用函数参数）：
-
-  Profile A "实时类" (realtime):
-    δ_b=0.20, δ_d=0.45, δ_j=0.25, δ_l=0.10
-    对应: 会话类
-
-  Profile B "流媒体类" (streaming):
-    δ_b=0.55, δ_d=0.15, δ_j=0.10, δ_l=0.20
-    对应: 流媒体类
-
-  Profile C "批量类" (bulk):
-    δ_b=0.40, δ_d=0.00, δ_j=0.00, δ_l=0.60
-    对应: 下载类、其他类
-
-  混合因子：
+  混合因子:
     交互类 = Profile A × 0.4 + Profile B × 0.6
-    （介于实时和流媒体之间，既有交互的实时性又有数据传输的吞吐需求）
 
-  结果：从 5×16=80 个参数 → 3×16+2=50 → 实际共用曲线参数后 → ~30 个可调参数
+总效用值:
+  U_final = ζ × U_current + (1-ζ) × U_predicted × e^(-λt)
+  ζ ∈ [0.6, 0.8]，当前效用值权重更高
 ```
 
-**P0 双路径下发详细流程：**
+### 📐 独立惩罚系数
 
 ```
-P0 级业务（会话类、交互类）路径管理：
+拥堵等级 L (1-3) 下各指标的惩罚公式:
 
-  初始化：
-    1. KSP 粗筛 → 5 条候选
-    2. 跳过拥堵等级=3 的链路（效用值×0.2）
-    3. QoS 精算 → 5 个 U_final
-    4. 排序取 Top 2
-    5. 路径不相交度检查（共享链路 ≤ 1）: Top2 不满足则取 Top1+Top3
-    6. 主路径 → priority=100, 批量下发
-    7. 备路径 → priority=50, 批量下发（预先写入交换机，不激活）
-
-  链路故障（PORT_STATUS_DOWN / LLDP 超时）：
-    1. 主路径链路断开 → 交换机自动切换到 priority=50 的备路径（无需控制器干预）
-    2. 同时：FF-LLDP 通道通知路由管理
-    3. 路由管理：删除断开的主路径流表
-    4. 路由管理：重新 KSP → 为新主路径选备路径
-    5. 新备路径 → priority=50, 下发到交换机
-    6. 始终保持交换机上有两条路径
-
-  链路拥堵（congestion_level≥2）：
-    1. 立即切换备路径
-    2. 通知路由管理重新计算
-    3. 路由管理：找到新主路径+新备路径
-    4. 批量下发
-
-  始终保证：交换机中主路径(priority=100) + 备路径(priority=50)
+  delay_penalty(L)     = base_delay    × (1 + k_d × L)   k_d = 0.5
+  jitter_penalty(L)    = base_jitter   × (1 + k_j × L)   k_j = 0.8
+  loss_penalty(L)      = base_loss     × (1 + k_l × L)   k_l = 1.0
+  throughput_penalty(L)= base_throughput / (1 + k_t × L)  k_t = 0.3
 ```
 
-**P1 单路径 + 缓存备选详细流程：**
+### 📐 P0 双路径下发流程
 
 ```
-P1 级业务（流媒体类、下载类、其他类）路径管理：
+初始化:
+  1. KSP 粗筛 → 5 条候选
+  2. 跳过拥堵等级=3 的链路（效用值×0.2）
+  3. QoS 精算 → 5 个 U_final
+  4. 排序取 Top 2
+  5. 路径不相交度检查（共享链路 ≤ 1）
+  6. 主路径 → priority=100, 批量下发
+  7. 备路径 → priority=50, 批量下发（预先写入交换机，不激活）
 
-  初始化：
-    1. KSP 粗筛 → 5 条候选
-    2. QoS 精算 → 取 Top 1
-    3. Top 1 下发到交换机（单路径，不批量下发）
-    4. Top 2 缓存到路由管理模块内存（不下发！）
-
-  链路故障：
-    1. 拓扑发现 → 更新拓扑图 → Redis version++
-    2. 盯梢者（路由管理）被唤醒
-    3. 立即下发缓存的 Top 2 到交换机（优先恢复通信）
-    4. 路由计算重新 KSP + QoS 精算
-    5. 新计算路径与刚下发的 Top 2 比较：
-       - U_new > U_old × 1.2 → 切换为新路径
-       - 否则 → 保持 Top 2 作为主路径
-    6. 计算新备选路径，缓存到路由管理
-
-  链路拥堵：
-    congestion_level=3 → 立即切换到缓存备选
-    congestion_level=2 → 等 500ms，仍拥堵则切换
-    congestion_level=1 → 等 2s，观察限速效果
-    congestion_level=0 → 不处理
-
-  始终保证：交换机中一条路径(主) + 路由管理中一条路径(备)
+故障:
+  1. 主路径链路断开 → 交换机自动切换到 priority=50 的备路径
+  2. 路由管理重新 KSP → 选新备路径 → 下发 priority=50
+  3. 始终保持交换机上有两条路径
 ```
 
-### 📐 接口定义
+### 📐 P1 单路径 + 缓存备选
 
-```python
-class RouteManager:
-    """
-    路由管理模块
-    - KSP 粗筛（K=5）
-    - 主备路径决策
-    - 灰度路由策略（P0/P1/P2）
-    """
+```
+初始化:
+  1. KSP → QoS 精算 → 取 Top 1 → 下发到交换机
+  2. Top 2 缓存到路由管理内存（不下发！）
 
-    def on_topology_change(self, event):
-        """盯梢者回调：拓扑变更时重新评估所有活跃路径"""
-        pass
+故障:
+  1. 拓扑变更 → Redis version++
+  2. 盯梢者唤醒路由管理 → 立即下发缓存的 Top 2
+  3. 重新 KSP + QoS 精算 → 与刚下发的路径比较
+     U_new > U_old × 1.2 → 切换
+     否则 → 保持当前
 
-    def on_congestion_alert(self, link_id, congestion_level):
-        """盯梢者回调：链路拥堵时执行分级策略"""
-        link_metric = self.redis.hgetall(f'perf:latest:{link_id}')
-        if congestion_level == 3:
-            self._emergency_switch(link_id)
-        elif congestion_level == 2:
-            threading.Timer(0.5, self._check_and_switch, args=(link_id,)).start()
-        elif congestion_level == 1:
-            threading.Timer(2.0, self._check_and_switch, args=(link_id,)).start()
-
-    def select_paths(self, src, dst, traffic_class) -> RouteDecision:
-        """
-        KSP 粗筛 → QoS 精算 → 分级决策
-        返回: {main_path, backup_path, strategy}
-        """
-        topo = self.redis.get('topology:graph:current')
-        candidates = yen_ksp(topo, src, dst, K=5)
-
-        # 惩罚拥堵链路
-        for path in candidates:
-            for link in path.links:
-                level = self.redis.hget(f'perf:latest:{link.id}', 'congestion_level')
-                path.apply_penalty(link, level)
-
-        # QoS 效用值精算
-        scores = self.rc.compute_qos_scores(candidates, traffic_class)
-
-        if traffic_class.priority == 'P0':
-            return self._decide_p0(scores)
-        else:
-            return self._decide_p1(scores)
-
-
-class RouteCalculator:
-    """
-    路由计算模块
-    - QoS 效用值精算
-    - 当前效用 + 衰减预测效用加权融合
-    - 独立惩罚系数
-    - ARP 处理机
-    """
-
-    def compute_qos_scores(self, paths: List[Path], traffic_class: TrafficClass) -> List[QoSScore]:
-        """
-        对每条候选路径计算 U_final
-        U_final = ζ × U_current + (1-ζ) × U_predicted × e^(-λt)
-        ζ ∈ [0.6, 0.8]  (当前效用值权重更高)
-        """
-        profile = self._get_profile(traffic_class)
-        current_metrics = self._fetch_current_metrics(paths)
-        predicted_metrics = self._fetch_predicted_metrics(paths)
-
-        scores = []
-        for path in paths:
-            U_cur = self._compute_utility(path, current_metrics[path.id], profile)
-            U_pred = self._compute_utility(path, predicted_metrics[path.id], profile)
-            # 预测效用时间衰减
-            U_pred = U_pred * math.exp(-0.1 * prediction_age)
-            U_final = 0.7 * U_cur + 0.3 * U_pred
-            scores.append(QoSScore(path_id=path.id, utility=U_final))
-
-        return sorted(scores, key=lambda s: s.utility, reverse=True)
+拥堵:
+  level=3 → 立即切备
+  level=2 → 等 500ms，仍拥堵则切
+  level=1 → 等 2s，观察限速效果
+  level=0 → 不处理
 ```
 
 ---
 
-## 8. 流表管理模块
+## 8. 流表管理模块 📐
+
+> **状态**: Phase 4 待实现
 
 ### 📐 接口定义
 
@@ -920,12 +832,10 @@ class FlowTableManager:
     - 冲突检测 + 优先级管理
     """
 
-    def compile_flow_rules(self, route_decision: RouteDecision,
-                           meter_policy: MeterPolicy,
-                           queue_policy: QueuePolicy) -> List[FlowRule]:
+    def compile_flow_rules(self, route_decision, meter_policy, queue_policy):
         """将路由+限速+队列策略编译为 OpenFlow 流表规则"""
         rules = []
-        # 主路径（priority=100）
+        # 主路径 (priority=100)
         rules.append(FlowRule(
             priority=100,
             match=route_decision.main_path.match_fields,
@@ -935,7 +845,7 @@ class FlowTableManager:
                 f'set_queue:{queue_policy.queue_id}'
             ]
         ))
-        # 备路径（priority=50，仅 P0）
+        # 备路径 (priority=50, 仅 P0)
         if route_decision.backup_path:
             rules.append(FlowRule(
                 priority=50,
@@ -944,60 +854,48 @@ class FlowTableManager:
             ))
         return rules
 
-    def check_conflicts(self, rules: List[FlowRule]) -> ConflictReport:
+    def check_conflicts(self, rules):
         """下发前检查同一流量是否匹配多条冲突规则"""
         pass
 
-    def deploy(self, rules: List[FlowRule]) -> bool:
+    def deploy(self, rules):
         """通过北向接口批量下发流表"""
-        return self.north_api.receive_flow_mods(rules)
+        pass
 ```
 
 ---
 
-## 9. 限速模块（Meter + 队列）
+## 9. 限速模块（Meter + 队列）📐
+
+> **状态**: Phase 5 待实现
 
 ### ❌ 去除的内容
 
 | 去除项 | 原因 | 替代方案 |
 |--------|------|---------|
-| 百分比速率（`OFPMF_BAND_PERCENTAGE`）— 兼容性不确定 | OVS 版本差异大 | 改为绝对速率配置；前端输入百分比 → 后端转换为绝对速率（bps） |
+| 百分比速率（`OFPMF_BAND_PERCENTAGE`） | OVS 版本兼容性不确定 | 前端输入百分比 → 后端转换为绝对速率（kbps） |
 
-### 🔧 细化的内容
+### 📐 拥堵等级联动限速
 
-**百分比 → 绝对速率转换：**
+| 等级 | Meter 限速 | Queue 限速 |
+|------|-----------|-----------|
+| 0 | 无变化 | 无变化 |
+| 1 | 降至 80% | 无变化 |
+| 2 | 降至 50% | 启用 |
+| 3 | 降至 20% | 严格限速 |
 
 ```
 前端配置: "限制到 30%"
 后端转换: rate = 端口带宽 × 30%
   - 端口带宽从拓扑图链路属性获取
-  - 下发 Meter 表时使用绝对值: OFPMF_KBPS, rate=30000 (单位 kbps)
-  - 避免依赖 `OFPMF_BAND_PERCENTAGE` 标志的兼容性问题
-```
-
-**拥堵等级联动限速：**
-
-```python
-class MeterLimiter:
-    """
-    Meter 限速模块
-    """
-    def on_congestion_alert(self, link_id, congestion_level):
-        """盯梢者回调：拥堵等级联动调整 Meter 速率"""
-        link = self.redis.hgetall(f'perf:latest:{link_id}')
-        base_rate = link['throughput']
-
-        # 拥堵等级 → 速率系数
-        coefficients = {0: 1.0, 1: 0.8, 2: 0.5, 3: 0.2}
-        new_rate = base_rate * coefficients[congestion_level]
-
-        # 下发新 Meter 配置
-        self.update_meter_entry(link_id, new_rate)
+  - 下发 Meter 表时使用绝对速率: OFPMF_KBPS, rate=30000
 ```
 
 ---
 
-## 10. 流量分类 + 流量预测模块
+## 10. 流量分类 + 流量预测模块 📐
+
+> **状态**: Phase 5 待实现
 
 ### 📐 接口定义
 
@@ -1005,19 +903,10 @@ class MeterLimiter:
 class TrafficClassifier:
     """
     流量分类模块（朴素贝叶斯）
-    - 定时批量训练（每 5 分钟从 MySQL 拉取最新数据）
+    - 五分类: 会话类/交互类/流媒体类/下载类/其他类
+    - 定时批量训练: 每 5 分钟
     - 分类结果写入 Redis: class:result:{flow_id}
     """
-
-    def run(self):
-        while True:
-            self.retrain()
-            time.sleep(300)  # 5 分钟
-
-    def classify(self, flow_features: dict) -> TrafficClass:
-        """对单个流进行分类"""
-        return self.model.predict(flow_features)
-
 
 class TrafficPredictor:
     """
@@ -1026,38 +915,15 @@ class TrafficPredictor:
     - 长期预测: 每 1 小时，预测未来 1 小时趋势
     - 结果写入 Redis: pred:forecast:{link_id}:{horizon}
     """
-
-    def run_short_term(self):
-        while True:
-            for link_id in self._get_active_links():
-                data = self._fetch_recent(link_id, minutes=30)
-                forecast = self.short_model.predict(data)
-                self.redis.set(
-                    f'pred:forecast:{link_id}:5min',
-                    json.dumps(forecast),
-                    ex=600  # 10 分钟过期
-                )
-            time.sleep(300)
-
-    def run_long_term(self):
-        while True:
-            # 从 MySQL 拉取过去 72 小时的每小时均值
-            for link_id in self._get_active_links():
-                data = self.mysql.query(link_id, hours=72, granularity='1h')
-                trend = self.long_model.predict(data)
-                self.redis.set(
-                    f'pred:forecast:{link_id}:1hour',
-                    json.dumps(trend),
-                    ex=7200
-                )
-            time.sleep(3600)
 ```
 
 ---
 
-## 11. 前端系统
+## 11. 前端系统 📐
 
-基于原设计的模块保持不变：
+> **状态**: Phase 6 待实现
+
+基于原设计的模块：
 
 - **首页**: 实时拓扑 WebGL 渲染 + 五类业务流分布占比
 - **网络拓扑**: 链路管理（30 天回溯）、边界端口管理
@@ -1116,13 +982,13 @@ CREATE TABLE perf_history (
 ) PARTITION BY RANGE (TO_DAYS(timestamp)) (
     PARTITION p_start VALUES LESS THAN (TO_DAYS('2026-01-01'))
 );
--- 每日自动创建分区，DROP PARTITION 清理 90 天前数据
+-- 每日自动创建分区，DROP PARTITION 清理 90 天前数据（瞬间完成，不锁表）
 
 -- 拓扑变更记录表
 CREATE TABLE topology_changelog (
     change_id CHAR(36) PRIMARY KEY,
     operation ENUM('ADD', 'DEL', 'MODIFY') NOT NULL,
-    src_device VARCHAR(23),       -- DPID
+    src_device VARCHAR(23),
     src_port VARCHAR(32),
     dst_device VARCHAR(23),
     dst_port VARCHAR(32),
@@ -1130,7 +996,7 @@ CREATE TABLE topology_changelog (
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_ts (timestamp)
 );
--- 保留 30 天，定时任务: DELETE WHERE timestamp < NOW() - INTERVAL 30 DAY
+-- 保留 30 天: DELETE WHERE timestamp < NOW() - INTERVAL 30 DAY
 
 -- 流量分类训练日志
 CREATE TABLE flow_class_log (
@@ -1155,81 +1021,63 @@ CREATE TABLE flow_class_log (
 
 ```
 ryu-sdn-project/
-├── requirements.txt
-├── config.yaml                      # 全局配置文件（新增）
+├── requirements.txt                 # 依赖: ryu, eventlet, redis, SQLAlchemy, PyMySQL
+├── .env                             # 环境变量 (REDIS_HOST 等)
+├── .env.example                     # 环境变量模板
+├── .gitignore
 ├── plans/
-│   └── final_architecture_plan.md   # 本文档
-├── controllers/
+│   ├── final_architecture_plan.md   # 本文档
+│   ├── dev_roadmap.md               # 开发路线图
+│   ├── phase3_implementation_plan.md# Phase 3 实现计划
+│   └── verification_plan.md         # 验证计划
+├── controllers/                     # 控制层 ✅ 全部已实现
 │   ├── __init__.py
-│   ├── app.py                       # Ryu 主控制器（纯透传）
-│   ├── transparent_proxy.py         # 透传路由 + Dispatcher + Ring Buffer
-│   ├── security_filter.py           # 安全过滤（窗口层使用）
-│   └── north_api.py                 # 北向 gRPC 接口
-├── modules/                         # 业务模块（全部新建）
+│   ├── app.py                       # Ryu 主控制器 (10 并发单元)
+│   ├── transparent_proxy.py         # metadata 方向分类
+│   ├── security_filter.py           # 前置安全过滤
+│   └── north_api.py                 # 北向接口 (占位)
+├── modules/                         # 功能模块层
 │   ├── __init__.py
-│   ├── message_queue/               # 消息队列模块
+│   ├── message_queue/               # ✅ 消息队列模块
 │   │   ├── __init__.py
 │   │   ├── ring_buffer.py           # SPSC Ring Buffer
-│   │   ├── dispatcher.py            # Hash 分发器
-│   │   └── worker.py                # 处理窗口
-│   ├── topology/                    # 拓扑发现模块
+│   │   ├── dispatcher.py            # Hash 分发器 + Dispatcher 线程
+│   │   └── worker.py                # Worker (SecurityFilter + StructuredMessage)
+│   ├── topology/                    # ✅ 拓扑发现模块
 │   │   ├── __init__.py
-│   │   ├── collector.py             # LLDP 采集
-│   │   ├── processor.py             # 拓扑处理 + 防抖 + Diff Engine
+│   │   ├── collector.py             # LLDP 采集 (独立线程 + 下行队列)
+│   │   ├── processor.py             # 拓扑处理 (防抖窗口 + Diff Engine)
 │   │   ├── validator.py             # LLDP 最小化校验
-│   │   └── lldp_utils.py            # LLDP 工具函数
-│   ├── performance/                 # 性能检测模块
+│   │   └── lldp_utils.py            # LLDP 构造/解析工具
+│   ├── performance/                 # ✅ 性能检测模块
 │   │   ├── __init__.py
-│   │   ├── monitor.py               # 主监控
-│   │   ├── sampler.py               # 自适应采样调度
-│   │   ├── detector.py              # EWMA 动态阈值 + 拥堵等级
-│   │   └── metrics.py               # 四指标计算
-│   ├── classification/              # 流量分类模块
-│   │   ├── __init__.py
-│   │   ├── classifier.py            # 朴素贝叶斯分类器
-│   │   └── trainer.py               # 定时批量训练
-│   ├── prediction/                  # 流量预测模块
-│   │   ├── __init__.py
-│   │   ├── lstm_model.py            # LSTM 模型定义
-│   │   ├── short_term.py            # 短期预测
-│   │   └── long_term.py             # 长期趋势
-│   ├── routing/                     # 路由模块
-│   │   ├── __init__.py
-│   │   ├── route_manager.py         # 路由管理（KSP + 分级决策）
-│   │   ├── route_calculator.py      # 路由计算（QoS 效用值精算）
-│   │   ├── ksp.py                   # Yen's KSP 算法
-│   │   ├── utility.py               # 效用函数（4 条曲线 + 3 Profile）
-│   │   ├── penalty.py               # 惩罚算法
-│   │   └── arp_handler.py           # ARP 处理机
-│   ├── flow_table/                  # 流表管理模块
-│   │   ├── __init__.py
-│   │   ├── compiler.py              # 策略→流表规则编译
-│   │   ├── conflict_checker.py      # 冲突检测
-│   │   └── deployer.py              # 北向下发
-│   ├── metering/                    # Meter 限速模块
-│   │   ├── __init__.py
-│   │   └── meter_limiter.py         # Meter 表管理 + 拥堵联动
-│   ├── queueing/                    # 队列限速模块
-│   │   ├── __init__.py
-│   │   └── queue_limiter.py         # OVSDB 队列配置
-│   └── stalker/                     # 盯梢者架构
-│       ├── __init__.py
-│       ├── stalker_manager.py       # 统一管理器 + 防惊群
-│       └── stalker_base.py          # 盯梢者基类
-├── storage/                         # 存储层（新建）
+│   │   ├── monitor.py               # 性能监控主循环 + ICMP 配对
+│   │   ├── detector.py              # EWMA 动态阈值 + 拥堵等级 0-3
+│   │   ├── metrics.py               # 四指标计算 (吞吐量/时延/抖动/丢包)
+│   │   └── sampler.py               # 自适应采样调度器
+│   ├── classification/              # 📐 流量分类 (Phase 5)
+│   │   └── __init__.py
+│   ├── prediction/                  # 📐 流量预测 (Phase 5)
+│   │   └── __init__.py
+│   ├── routing/                     # 📐 路由模块 (Phase 4)
+│   │   └── __init__.py
+│   ├── flow_table/                  # 📐 流表管理 (Phase 4)
+│   │   └── __init__.py
+│   ├── metering/                    # 📐 Meter 限速 (Phase 5)
+│   │   └── __init__.py
+│   ├── queueing/                    # 📐 队列限速 (Phase 5)
+│   │   └── __init__.py
+│   └── stalker/                     # 📐 盯梢者架构 (Phase 3)
+│       └── __init__.py
+├── storage/                         # 存储层
 │   ├── __init__.py
-│   ├── redis_client.py              # Redis 连接池 + Stream 工具
-│   ├── mysql_client.py              # MySQL 连接池 + 分区管理
-│   └── migrations/                  # 数据库迁移
-├── frontend/                        # 前端系统（待新建）
-├── models/                          # ML 模型文件
-│   ├── nb_classifier.pkl            # 朴素贝叶斯模型
-│   └── lstm_predictor.h5            # LSTM 模型
-└── tests/                           # 测试代码（新建）
-    ├── test_topology.py
-    ├── test_performance.py
-    ├── test_routing.py
-    └── test_stalker.py
+│   ├── redis_client.py              # 🔧 Redis 连接池 + Key 初始化
+│   └── migrations/                  # 📐 数据库迁移
+├── topology/                        # 拓扑定义
+│   └── simple_topology.py           # Mininet 拓扑脚本
+├── scripts/
+│   └── generate_paper.py            # 论文生成脚本
+└── models/                          # 📐 ML 模型文件 (Phase 5)
 ```
 
 ---
@@ -1242,8 +1090,8 @@ ryu-sdn-project/
 |---|--------|------|---------|
 | 1 | DMA/vhost-user 直通 | 硬件依赖，不可软件实现 | `collections.deque` Ring Buffer |
 | 2 | 盯梢者零拷贝共享内存 | Redis C/S 架构不支持 | epoll 唤醒 + 一次 socket 读取 |
-| 3 | 三窗口类 RAFT 协议 | 单机场景过度设计 | Redis Stream + Consumer ACK |
-| 4 | 消息队列无锁直接写入 | 多线程写同一队列必须有锁 | SPSC Ring Buffer（每窗口独立队列） |
+| 3 | 三窗口类 RAFT 协议 | 单机场景过度设计 | 无需替代（单进程内线程通信） |
+| 4 | 消息队列无锁直接写入 | 多线程写同一队列必须有锁 | SPSC Ring Buffer（单消费者无需锁） |
 | 5 | 降级队列动态切换 | 阈值震荡问题 | 始终走 Ring Buffer（纳秒级延迟） |
 | 6 | 百分比 Meter 速率配置 | OVS 兼容性不确定 | 前端百分比 → 后端转换绝对速率 |
 | 7 | 五套独立效用函数（~80 参数） | 参数爆炸不可调优 | 3 Profile + 2 因子（~30 参数） |
@@ -1252,37 +1100,37 @@ ryu-sdn-project/
 
 | # | 原设计模糊点 | 细化后 |
 |---|------------|--------|
-| 1 | metadata 标签谁来打 | 流表管理模块在下发流表时预设 metadata 匹配字段 |
-| 2 | 浅解析边界 | 仅解析 OpenFlow 消息头 + L2 帧头（ethertype） |
-| 3 | 超时闹钟防抖饥饿 | 最大防抖上限 5 秒，超时强制写入 |
+| 1 | metadata 标签谁来打 | LLDPCollector 下发 PacketOut 时 `OFPActionSetField(metadata=1)` |
+| 2 | 浅解析边界 | 仅解析 L2 帧头 ethertype（14 字节），不复解析 |
+| 3 | 超时闹钟防抖饥饿 | 最大防抖上限 5s，超时强制 flush |
 | 4 | 盯梢者惊群问题 | Stalker Manager 级联唤醒 + 不同 key 隔离 |
 | 5 | "大很多"阈值 | >20% 立即切换；10%-20% 下周期切换 |
-| 6 | P1 拥堵等待 5 秒 | 拥堵等级 3→立即/2→500ms/1→2s |
-| 7 | FF-LLDP 实现细节 | 独立 Ring Buffer + 信号量通知，Dispatcher 优先检查 |
-| 8 | 零权重指标 | 保留最小基线值 0.05，避免极端情况 |
-| 9 | MySQL 清理策略 | 分区表 DROP PARTITION，瞬间完成 |
-| 10 | Redis/MySQL 双写一致性 | Redis 同步主写 + MySQL 异步副写 + 死信补偿 |
-| 11 | 实时拥堵直接删链路 | 改为大幅降权（×0.2），保留为最后选择 |
-| 12 | 拓扑增量更新 | Diff Engine 计算增量 Patch，非全量替换 |
+| 6 | P1 拥堵等待 | 拥堵等级 3→立即 / 2→500ms / 1→2s |
+| 7 | 零权重指标 | 保留最小基线值 0.05，避免极端情况 |
+| 8 | MySQL 清理策略 | 分区表 DROP PARTITION，瞬间完成不锁表 |
+| 9 | Redis/MySQL 双写一致性 | Redis 同步主写 + MySQL 异步副写 + 死信补偿 |
+| 10 | 实时拥堵直接删链路 | 改为大幅降权（×0.2），保留为最后选择 |
+| 11 | 拓扑增量更新 | Diff Engine 计算增量 Patch |
+| 12 | 东向队列 fan-out | topo_east_queue + perf_east_queue 分离，消除竞争消费 |
 
 ### ✅ 完整保留的创新设计（13 项）
 
-| # | 创新设计 | 所属模块 |
-|---|---------|---------|
-| 1 | 纯透传理念（主控零处理） | 主控 |
-| 2 | 数据库替代控制器作为交互中心 | 数据库 |
-| 3 | 盯梢者架构（epoll 阻塞唤醒） | 数据库 |
-| 4 | KPS 粗筛 + QoS 效用值精算双层路径选择 | QoS-KPS |
-| 5 | P0 级双路径预批量下发（亚毫秒故障恢复） | QoS-KPS |
-| 6 | 多维度 QoS 效用函数 + 业务差异化权重 | QoS-KPS |
-| 7 | Redis version 单调递增单图策略 | 拓扑发现 |
-| 8 | 惩罚算法（降权而非删除） | QoS-KPS |
-| 9 | 拓扑发现采集/处理分离 + metadata 标签 | 拓扑发现 |
-| 10 | 四指标性能检测 + 多级采样粒度 | 性能检测 |
-| 11 | 三窗口并行处理 | 消息队列 |
-| 12 | Redis 分区（拓扑区 + 性能区） | 数据库 |
-| 13 | 模块间高度解耦 | 全局架构 |
+| # | 创新设计 | 所属模块 | 状态 |
+|---|---------|---------|------|
+| 1 | 纯透传理念（主控零处理） | 主控 | ✅ |
+| 2 | 数据库替代控制器作为交互中心 | 数据库 | 🔧 |
+| 3 | 盯梢者架构（epoll 阻塞唤醒） | 数据库 | 📐 |
+| 4 | KPS 粗筛 + QoS 效用值精算双层路径选择 | QoS-KPS | 📐 |
+| 5 | P0 级双路径预批量下发（亚毫秒故障恢复） | QoS-KPS | 📐 |
+| 6 | 多维度 QoS 效用函数 + 业务差异化权重 | QoS-KPS | 📐 |
+| 7 | Redis version 单调递增单图策略 | 拓扑发现 | 📐 |
+| 8 | 惩罚算法（降权而非删除） | QoS-KPS | 📐 |
+| 9 | 拓扑发现采集/处理分离 + metadata 标签 | 拓扑发现 | ✅ |
+| 10 | 四指标性能检测 + EWMA 动态阈值 | 性能检测 | ✅ |
+| 11 | 三窗口并行处理 + fan-out 三队列 | 消息队列 | ✅ |
+| 12 | Redis 分区（拓扑区 + 性能区） | 数据库 | 📐 |
+| 13 | 模块间高度解耦 | 全局架构 | ✅ |
 
 ---
 
-> **方案说明**：本方案完整保留了你原设计的 13 项核心创新，去除了 7 项过度设计或不可实现的部分，细化了 12 项模糊边界。所有细化后的设计都有明确的参数、阈值和实现策略，可直接用于编码实现。模块接口定义采用 Python 伪代码，与 Ryu 框架兼容。
+> **版本说明**：本文档基于实际代码实现更新（2026-05-10）。标注 ✅ 的模块已完整实现并通过验证，标注 🔧 的模块正在实现中，标注 📐 的模块接口已定义待实现。所有实现细节均直接引用源码文件和行号，确保文档与代码一致。

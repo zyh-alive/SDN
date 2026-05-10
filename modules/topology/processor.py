@@ -34,6 +34,7 @@
 """
 
 import time
+import json
 import threading
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
@@ -193,8 +194,15 @@ class TopologyGraph:
             return sum(1 for l in self._graph["links"].values() if l["status"] == "UP")
 
     def to_dict(self) -> dict:
-        """获取可 JSON 序列化的图谱"""
-        return self.get_full()
+        """获取可 JSON 序列化的图谱（tuple key → str key）"""
+        full = self.get_full()
+        links_str = {}
+        for key, val in full.get("links", {}).items():
+            if isinstance(key, tuple):
+                key = f"{key[0]}:{key[1]}:{key[2]}:{key[3]}"
+            links_str[str(key)] = val
+        full["links"] = links_str
+        return full
 
     def __repr__(self):
         return (f"TopologyGraph(switches={self.get_switch_count()}, "
@@ -329,8 +337,10 @@ class TopologyProcessor:
     # 超时扫描间隔
     TIMEOUT_SCAN_INTERVAL = 10.0
 
-    def __init__(self, logger=None):
+    def __init__(self, logger=None, redis_client=None):
         self.logger = logger
+        self._redis = redis_client               # Phase 3: Redis 客户端引用（可延迟注入）
+        self._stalker_manager = None             # Phase 3: 盯梢者管理器引用
         self.graph = TopologyGraph()
         self.validator = LLDPValidator()
         self.debounce = DebounceWindow(base_window=2.0, max_window=5.0)
@@ -350,6 +360,40 @@ class TopologyProcessor:
         self._event_lock = threading.Lock()
         self._event_available = threading.Condition(self._event_lock)
 
+    def set_redis(self, redis_client):
+        """Phase 3: 延迟注入 Redis 客户端"""
+        self._redis = redis_client
+
+    def set_stalker_manager(self, stalker_manager):
+        """Phase 3: 注入盯梢者管理器（进程内直接通知）"""
+        self._stalker_manager = stalker_manager
+
+    # ── Phase 3: Redis 写入（极简：全量快照 + 版本号） ──
+
+    def _write_to_redis(self, events):
+        """
+        每次 flush 时写入 Redis：
+          SET  topology:graph:current  — JSON 全量快照
+          INCR topology:graph:version  — 单调递增版本号
+        并进程内直接通知 StalkerManager（零网络开销）。
+        """
+        if not self._redis:
+            return
+
+        client = self._redis.client
+        pipe = client.pipeline()
+        pipe.set('topology:graph:current', json.dumps(self.graph.to_dict()))
+        pipe.incr('topology:graph:version')
+        pipe.execute()
+
+        # 进程内唤醒盯梢者（零网络、零轮询）
+        self._notify_stalkers(events)
+
+    def _notify_stalkers(self, events):
+        """进程内直接调用 StalkerManager（零 Redis 中间层）"""
+        if self._stalker_manager is not None:
+            self._stalker_manager.notify(events)
+
     def start(self):
         """启动拓扑处理器线程（防抖 flush + 超时扫描）"""
         if self._running:
@@ -368,6 +412,8 @@ class TopologyProcessor:
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
+        if self.logger:
+            self.logger.info("[TopologyProcessor] Stopped")
 
     def _run_loop(self):
         """主循环：周期性检查防抖窗口 + 超时链表"""
@@ -402,6 +448,9 @@ class TopologyProcessor:
             self._event_available.notify_all()
 
         self._total_events_emitted += len(events)
+
+        # ── Phase 3: 写入 Redis ──
+        self._write_to_redis(events)
 
         if self.logger:
             for e in events:
@@ -503,7 +552,16 @@ class TopologyProcessor:
         return self.graph.to_dict()
 
     def stats(self) -> dict:
+        # Phase 3: Redis 连接状态
+        _redis_ok = False
+        if self._redis is not None:
+            try:
+                _redis_ok = self._redis.ping()
+            except Exception:
+                _redis_ok = False
+
         return {
+            "redis_connected": _redis_ok,
             "total_processed": self._total_processed,
             "lldp_valid": self._total_lldp_valid,
             "lldp_invalid": self._total_lldp_invalid,
