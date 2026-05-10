@@ -987,7 +987,7 @@ CREATE TABLE perf_history (
 -- 拓扑变更记录表
 CREATE TABLE topology_changelog (
     change_id CHAR(36) PRIMARY KEY,
-    operation ENUM('ADD', 'DEL', 'MODIFY') NOT NULL,
+    operation ENUM('ADD', 'DELETE', 'MODIFY') NOT NULL,
     src_device VARCHAR(23),
     src_port VARCHAR(32),
     dst_device VARCHAR(23),

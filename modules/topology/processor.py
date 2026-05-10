@@ -35,6 +35,7 @@
 
 import time
 import json
+import uuid
 import threading
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
@@ -337,9 +338,10 @@ class TopologyProcessor:
     # 超时扫描间隔
     TIMEOUT_SCAN_INTERVAL = 10.0
 
-    def __init__(self, logger=None, redis_client=None):
+    def __init__(self, logger=None, redis_client=None, mysql_writer=None):
         self.logger = logger
         self._redis = redis_client               # Phase 3: Redis 客户端引用（可延迟注入）
+        self._mysql_writer = mysql_writer        # Phase 3: MySQL 异步写入器引用（可延迟注入）
         self._stalker_manager = None             # Phase 3: 盯梢者管理器引用
         self.graph = TopologyGraph()
         self.validator = LLDPValidator()
@@ -368,6 +370,10 @@ class TopologyProcessor:
         """Phase 3: 注入盯梢者管理器（进程内直接通知）"""
         self._stalker_manager = stalker_manager
 
+    def set_mysql_writer(self, mysql_writer):
+        """Phase 3: 注入 MySQL 异步写入器（fire-and-forget）"""
+        self._mysql_writer = mysql_writer
+
     # ── Phase 3: Redis 写入（极简：全量快照 + 版本号） ──
 
     def _write_to_redis(self, events):
@@ -393,6 +399,34 @@ class TopologyProcessor:
         """进程内直接调用 StalkerManager（零 Redis 中间层）"""
         if self._stalker_manager is not None:
             self._stalker_manager.notify(events)
+
+    # ── Phase 3: MySQL 异步写入（fire-and-forget） ──
+
+    def _enqueue_mysql(self, events):
+        """放入 MySQL 后台写入队列后立即返回（~μs 级）
+
+        调用方（_apply_events）不会被 MySQL 阻塞：
+          1. 构造 dict 列表（纯内存操作）
+          2. 逐个调用 self._mysql_writer.enqueue()（queue.put_nowait）
+          3. 返回
+
+        后台 MySQLWriterThread 按 1s 间隔/200 条批次上限批量写入。
+        """
+        if self._mysql_writer is None:
+            return
+
+        graph_version = self.graph.get_version()
+        for e in events:
+            row = {
+                'change_id': uuid.uuid4().hex,
+                'operation': e.event_type,
+                'src_device': f"{e.src_dpid:016x}",
+                'src_port': str(e.src_port),
+                'dst_device': f"{e.dst_dpid:016x}",
+                'dst_port': str(e.dst_port),
+                'topology_version': graph_version,
+            }
+            self._mysql_writer.enqueue(row)
 
     def start(self):
         """启动拓扑处理器线程（防抖 flush + 超时扫描）"""
@@ -451,6 +485,9 @@ class TopologyProcessor:
 
         # ── Phase 3: 写入 Redis ──
         self._write_to_redis(events)
+
+        # ── Phase 3: 异步写入 MySQL（fire-and-forget，不阻塞） ──
+        self._enqueue_mysql(events)
 
         if self.logger:
             for e in events:

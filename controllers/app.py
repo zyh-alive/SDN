@@ -46,6 +46,7 @@ from modules.topology.processor import TopologyProcessor
 from modules.topology.lldp_utils import dpid_to_mac
 from modules.performance.monitor import PerformanceMonitor
 from storage.redis_client import RedisClient
+from storage.mysql_client import MySQLClient, MySQLWriterThread
 from modules.stalker.stalker_manager import StalkerManager
 from modules.routing.route_manager import RouteManager
 
@@ -79,6 +80,20 @@ class SDNController(app_manager.RyuApp):
         self.redis_client = RedisClient(logger=self.logger)
         self.redis_client.init_topology_keys()
 
+        # ── Phase 3: 初始化 MySQL ──
+        self.mysql_client = MySQLClient(logger=self.logger)
+        # 表结构由 Alembic Migration 管理（启动前运行: alembic upgrade head）
+        # 启动异步写入后台线程（1s 间隔 / 200 条批次上限 / 10000 队列容量）
+        self.mysql_writer = MySQLWriterThread(
+            mysql_client=self.mysql_client,
+            flush_interval=1.0,
+            batch_size=200,
+            queue_maxsize=10000,
+            logger=self.logger,
+        )
+        self.mysql_writer.start()
+        self.logger.info("🗄️  Phase 3: MySQL connected (async writer started)")
+
         # ── Phase 3: 初始化 StalkerManager + RouteManager ──
         self.stalker_manager = StalkerManager(logger=self.logger)
         self.route_manager = RouteManager(logger=self.logger)
@@ -88,7 +103,8 @@ class SDNController(app_manager.RyuApp):
         # ── Phase 2: 拓扑发现模块 ──
         self.lldp_collector = LLDPCollector(logger=self.logger)
         self.topology_processor = TopologyProcessor(logger=self.logger,
-                                                     redis_client=self.redis_client)
+                                                     redis_client=self.redis_client,
+                                                     mysql_writer=self.mysql_writer)
         # 进程内通知：processor → StalkerManager → RouteManager（零 Redis 中间层）
         self.topology_processor.set_stalker_manager(self.stalker_manager)
 
@@ -116,7 +132,7 @@ class SDNController(app_manager.RyuApp):
         self._stats_interval = 10.0  # 每 10 秒输出一次综合统计
 
         self.logger.info("=" * 60)
-        self.logger.info("SDN 主控制器启动（Phase 3: Redis 拓扑快照 + Storage 层）")
+        self.logger.info("SDN 主控制器启动（Phase 3: Redis + MySQL + Stalker）")
         self.logger.info(f"📍 Ring Buffer: capacity={self.ring_buffer.capacity}")
         self.logger.info(f"📍 Dispatcher: {len(self.dispatcher.workers)} workers "
                          f"+ {len(self.dispatcher.workers)} worker threads "
@@ -124,6 +140,7 @@ class SDNController(app_manager.RyuApp):
         self.logger.info("📍 东向通道(fan-out): PacketIn → RingBuffer → Dispatcher → Workers → topo_east + perf_east")
         self.logger.info("📍 西向通道: PacketIn → Dispatcher.dispatch() → Workers → west_queue")
         self.logger.info("📍 拓扑发现: LLDPCollector + TopologyProcessor (topo_east_queue)")
+        self.logger.info("📍 存储: Redis (快照+version) + MySQL (changelog 异步批量写入)")
         self.logger.info("📍 性能检测: PerformanceMonitor (perf_east_queue)")
         self.logger.info("=" * 60)
 
@@ -220,11 +237,19 @@ class SDNController(app_manager.RyuApp):
                 f"running={w['running']})"
             )
 
+        # MySQL 异步写入统计
+        mysql_stats = self.mysql_writer.stats()
+        mysql_ping = self.mysql_client.ping()
+
         self.logger.info(
             f"📊 [Phase 3] Topology: {topo_stats['graph']['switches']} switches, "
             f"{topo_stats['graph']['links']} links (v{topo_stats['graph']['version']}), "
             f"LLDP valid={topo_stats['lldp_valid']} invalid={topo_stats['lldp_invalid']}, "
-            f"Redis={'✅' if topo_stats.get('redis_connected') else '❌'}"
+            f"Redis={'✅' if topo_stats.get('redis_connected') else '❌'}, "
+            f"MySQL={'✅' if mysql_ping else '❌'} "
+            f"(enq={mysql_stats['enqueued']} wr={mysql_stats['written']} "
+            f"fail={mysql_stats['failed']} drop={mysql_stats['dropped']} "
+            f"q={mysql_stats['queued']})"
         )
 
         self.logger.info(
