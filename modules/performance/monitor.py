@@ -54,14 +54,16 @@ class PerformanceMonitor:
     # 结果轮询间隔
     RESULT_POLL_INTERVAL = 1.0
 
-    def __init__(self, east_queues: List, logger=None):
+    def __init__(self, east_queues: List, logger=None, mysql_writer=None):
         """
         Args:
             east_queues: Worker 的 east_queue 列表
             logger: 日志器
+            mysql_writer: MySQLWriterThread 实例（可选，用于异步写入 perf_history）
         """
         self.east_queues = east_queues
         self.logger = logger
+        self._mysql_writer = mysql_writer
 
         # 子组件
         self.calculator = MetricsCalculator()
@@ -266,6 +268,25 @@ class PerformanceMonitor:
                 self._latest_metrics[link_key] = metrics
                 self._latest_levels[link_key] = level
                 self._results_available.notify_all()
+
+            # ── 异步写入 MySQL（fire-and-forget，不阻塞） ──
+            self._enqueue_perf(link_key, metrics, level)
+
+    def _enqueue_perf(self, link_key: Tuple, metrics: LinkMetrics, level: int):
+        """Fire-and-forget：将性能数据异步写入 MySQL perf_history 表"""
+        if self._mysql_writer is None:
+            return
+        # link_id: 格式化为 "{dpid}:{port}"（单向入口标识）
+        link_id_str = f"{link_key[0]:016x}:{link_key[1]}"
+        row = {
+            'link_id': link_id_str,
+            'throughput': metrics.throughput,
+            'delay': metrics.delay,
+            'jitter': metrics.jitter,
+            'packet_loss': metrics.packet_loss,
+            'congestion_level': level,
+        }
+        self._mysql_writer.enqueue(row)
 
     def poll_results(self, timeout: Optional[float] = None) -> Tuple[Dict, Dict]:
         """

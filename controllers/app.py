@@ -83,16 +83,29 @@ class SDNController(app_manager.RyuApp):
         # ── Phase 3: 初始化 MySQL ──
         self.mysql_client = MySQLClient(logger=self.logger)
         # 表结构由 Alembic Migration 管理（启动前运行: alembic upgrade head）
-        # 启动异步写入后台线程（1s 间隔 / 200 条批次上限 / 10000 队列容量）
+
+        # 拓扑变更异步写入（使用 insert_changelog_batch）
         self.mysql_writer = MySQLWriterThread(
             mysql_client=self.mysql_client,
+            write_fn=self.mysql_client.insert_changelog_batch,
             flush_interval=1.0,
             batch_size=200,
             queue_maxsize=10000,
             logger=self.logger,
         )
         self.mysql_writer.start()
-        self.logger.info("🗄️  Phase 3: MySQL connected (async writer started)")
+
+        # 性能历史异步写入（使用 insert_perf_batch，独立队列不互相影响）
+        self.perf_writer = MySQLWriterThread(
+            mysql_client=self.mysql_client,
+            write_fn=self.mysql_client.insert_perf_batch,
+            flush_interval=1.0,
+            batch_size=200,
+            queue_maxsize=10000,
+            logger=self.logger,
+        )
+        self.perf_writer.start()
+        self.logger.info("🗄️  Phase 3: MySQL connected (async writers: topology + perf)")
 
         # ── Phase 3: 初始化 StalkerManager + RouteManager ──
         self.stalker_manager = StalkerManager(logger=self.logger)
@@ -122,7 +135,8 @@ class SDNController(app_manager.RyuApp):
 
         # ── Phase 2: 性能检测模块（fan-out 修复：使用独立 perf_east_queue） ──
         perf_queues = self.get_perf_east_queues()
-        self.perf_monitor = PerformanceMonitor(perf_queues, logger=self.logger)
+        self.perf_monitor = PerformanceMonitor(perf_queues, logger=self.logger,
+                                                mysql_writer=self.perf_writer)
 
         # 启动性能监控
         self.perf_monitor.start()
@@ -140,7 +154,7 @@ class SDNController(app_manager.RyuApp):
         self.logger.info("📍 东向通道(fan-out): PacketIn → RingBuffer → Dispatcher → Workers → topo_east + perf_east")
         self.logger.info("📍 西向通道: PacketIn → Dispatcher.dispatch() → Workers → west_queue")
         self.logger.info("📍 拓扑发现: LLDPCollector + TopologyProcessor (topo_east_queue)")
-        self.logger.info("📍 存储: Redis (快照+version) + MySQL (changelog 异步批量写入)")
+        self.logger.info("📍 存储: Redis (快照+version) + MySQL (changelog + perf 异步批量写入)")
         self.logger.info("📍 性能检测: PerformanceMonitor (perf_east_queue)")
         self.logger.info("=" * 60)
 
@@ -239,6 +253,7 @@ class SDNController(app_manager.RyuApp):
 
         # MySQL 异步写入统计
         mysql_stats = self.mysql_writer.stats()
+        perf_writer_stats = self.perf_writer.stats()
         mysql_ping = self.mysql_client.ping()
 
         self.logger.info(
@@ -247,9 +262,12 @@ class SDNController(app_manager.RyuApp):
             f"LLDP valid={topo_stats['lldp_valid']} invalid={topo_stats['lldp_invalid']}, "
             f"Redis={'✅' if topo_stats.get('redis_connected') else '❌'}, "
             f"MySQL={'✅' if mysql_ping else '❌'} "
-            f"(enq={mysql_stats['enqueued']} wr={mysql_stats['written']} "
+            f"topo(enq={mysql_stats['enqueued']} wr={mysql_stats['written']} "
             f"fail={mysql_stats['failed']} drop={mysql_stats['dropped']} "
-            f"q={mysql_stats['queued']})"
+            f"q={mysql_stats['queued']}) "
+            f"perf(enq={perf_writer_stats['enqueued']} wr={perf_writer_stats['written']} "
+            f"fail={perf_writer_stats['failed']} drop={perf_writer_stats['dropped']} "
+            f"q={perf_writer_stats['queued']})"
         )
 
         self.logger.info(

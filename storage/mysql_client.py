@@ -19,6 +19,7 @@ import queue
 import threading
 import time
 import uuid
+from typing import Callable, List
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -129,6 +130,36 @@ class MySQLClient:
                 self.logger.exception("[MySQLClient] Batch insert failed (%d rows)", len(rows))
             raise
 
+    def insert_perf_batch(self, rows: list[dict]) -> int:
+        """批量插入性能历史数据（executemany 单次网络往返）
+
+        Args:
+            rows: [{'link_id': str, 'throughput': float, 'delay': float,
+                    'jitter': float, 'packet_loss': float, 'congestion_level': int}, ...]
+
+        Returns:
+            实际插入行数
+        """
+        if not rows:
+            return 0
+
+        insert_sql = text("""
+            INSERT INTO perf_history
+                (link_id, throughput, delay, jitter, packet_loss, congestion_level)
+            VALUES
+                (:link_id, :throughput, :delay, :jitter, :packet_loss, :congestion_level)
+        """)
+
+        try:
+            with self._engine.connect() as conn:
+                conn.execute(insert_sql, rows)
+                conn.commit()
+            return len(rows)
+        except Exception:
+            if self.logger:
+                self.logger.exception("[MySQLClient] Perf batch insert failed (%d rows)", len(rows))
+            raise
+
     @property
     def engine(self) -> Engine:
         return self._engine
@@ -141,10 +172,14 @@ class MySQLClient:
 
 
 class MySQLWriterThread:
-    """后台异步写入线程 — fire-and-forget 模式
+    """后台异步写入线程 — fire-and-forget 模式（泛化：支持任意表）
 
-    调用者调用 enqueue(event_dict) 立即返回（~μs 级），
+    调用者调用 enqueue(row_dict) 立即返回（~μs 级），
     后台线程按 1s 间隔或 200 条批次上限批量写入 MySQL。
+
+    通过 write_fn 自定义写入逻辑：
+      - 拓扑变更: lambda batch: client.insert_changelog_batch(batch)
+      - 性能历史: lambda batch: client.insert_perf_batch(batch)
 
     线程安全：queue.Queue 自身线程安全，统计计数器使用 threading.Lock。
     """
@@ -152,6 +187,7 @@ class MySQLWriterThread:
     def __init__(
         self,
         mysql_client: MySQLClient,
+        write_fn: Callable[[List[dict]], int] | None = None,
         flush_interval: float = 1.0,
         batch_size: int = 200,
         queue_maxsize: int = 10000,
@@ -159,6 +195,8 @@ class MySQLWriterThread:
     ):
         self._client = mysql_client
         self.logger = logger or logging.getLogger(__name__)
+        # 默认写 changelog（向后兼容）
+        self._write_fn = write_fn or mysql_client.insert_changelog_batch
         self._flush_interval = flush_interval
         self._batch_size = batch_size
 
@@ -175,24 +213,23 @@ class MySQLWriterThread:
 
     # ── 生产者接口 ─────────────────────────────────
 
-    def enqueue(self, event_dict: dict):
+    def enqueue(self, row_dict: dict):
         """Fire-and-forget：放入队列后立即返回。
 
         Args:
-            event_dict: {'change_id': str (UUID hex), 'operation': 'ADD'|'DELETE'|'MODIFY',
-                         'src_device': str (hex dpid), 'src_port': str(int),
-                         'dst_device': str (hex dpid), 'dst_port': str(int),
-                         'topology_version': int}
+            row_dict: 一行 dict，字段由 write_fn 决定
+                      （拓扑变更: change_id/operation/src_device/...，
+                        性能历史: link_id/throughput/delay/jitter/...）
         """
         try:
-            self._queue.put_nowait(event_dict)
+            self._queue.put_nowait(row_dict)
             with self._lock:
                 self._total_enqueued += 1
         except queue.Full:
             # 队列满 → 丢弃（保护内存），记录老消息
             try:
                 self._queue.get_nowait()
-                self._queue.put_nowait(event_dict)
+                self._queue.put_nowait(row_dict)
                 with self._lock:
                     self._total_dropped += 1
                     self._total_enqueued += 1
@@ -264,11 +301,11 @@ class MySQLWriterThread:
                 time.sleep(0.5)
 
     def _write_batch(self, batch: list):
-        """写入一批数据到 MySQL"""
+        """写入一批数据到 MySQL（通过 write_fn 委托到具体表）"""
         if not batch:
             return
         try:
-            written = self._client.insert_changelog_batch(batch)
+            written = self._write_fn(batch)
             with self._lock:
                 self._total_written += written
                 if written < len(batch):
