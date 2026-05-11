@@ -70,7 +70,8 @@ class LLDPCollector:
     def register_switch(self, dpid: int, datapath):
         """注册交换机（由 app.py 在 switch_features_handler 中调用）"""
         with self._lock:
-            self._switches[dpid] = SwitchHandle(dpid, datapath)
+            self._switches[dpid] = SwitchHandle(dpid, datapath) 
+            #把交换机注册到采集器的交换机表中，供后续发送 LLDP 包使用，这是个字典，键是交换机的 DPID，值是一个 SwitchHandle 对象，包含了交换机的连接信息和通信接口
         if self.logger:
             self.logger.info(f"[LLDPCollector] Registered switch {dpid:016x}")
 

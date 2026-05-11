@@ -35,23 +35,18 @@ class SecurityFilter:
             msg: Ryu PacketIn 消息对象 (ev.msg)
 
         Returns:
-            True: 通过，进入消息队列
+            True: 息队列通过，进入消
             False: 丢弃
         """
-        self._total_checked += 1
+        self._total_checked += 1 #检察包数量加1
 
-        data = getattr(msg, 'data', b'')
+        data = getattr(msg, 'data', b'') #获取 PacketIn 消息中的原始数据包字节序列，data 属性包含了接收到的数据包的原始字节，如果 msg 对象没有 data 属性，则默认使用空字节串 b''，以避免访问不存在的属性导致错误
         if len(data) > 65535:
-            self._total_dropped += 1
+            self._total_dropped += 1 #丢弃包数量加1
             self.logger.debug(
-                f"SecurityFilter(pre): dropped oversized packet ({len(data)}B)"
+                f"每个包安全检查： 丢弃的包大小 ({len(data)}B)"
+                #格式化字符串，{}用来插入变量的值，len(data)表示数据包的字节长度
             )
             return False
 
         return True
-
-    def stats(self) -> dict:
-        return {
-            "prefilter_checked": self._total_checked,
-            "prefilter_dropped": self._total_dropped,
-        }

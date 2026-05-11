@@ -78,6 +78,8 @@ def compile_path_rules(
     ip_proto: Optional[int] = None,
     src_port: Optional[int] = None,
     dst_port: Optional[int] = None,
+    first_hop_in_port: Optional[int] = None,
+    dst_host_port: Optional[int] = None,
     priority: int = PRIORITY_PRIMARY,
     rule_prefix: str = "route",
     table_id: int = 0,
@@ -85,9 +87,9 @@ def compile_path_rules(
     """
     将一条路径编译为逐跳流表规则列表。
 
-    对路径上的每个交换机（除最后一跳外）生成一条流表规则：
-      - match: in_port + 可选的 L2/L3/L4 字段
-      - action: output 到该交换机的出端口
+    对路径上的每个中间交换机生成一条流表规则，并在终点交换机生成最终转发规则：
+      - 中间跳: match: in_port + 可选的 L2/L3/L4 字段 → action: output 到下一跳出端口
+      - 终点跳: match: in_port + 可选的 L2/L3/L4 字段 → action: output 到 dst_host_port
 
     Args:
         path:       交换机 DPID 序列（如 [1, 4, 7]）
@@ -101,15 +103,50 @@ def compile_path_rules(
         ip_proto:   IP 协议号（可选，6=TCP, 17=UDP）
         src_port:   源 L4 端口（可选）
         dst_port:   目的 L4 端口（可选）
+        first_hop_in_port: 首跳交换机入端口（主机侧端口，由 ArpHandler 学习提供）
+        dst_host_port:     目的主机所在交换机的出端口（主机侧端口）
         priority:   规则优先级
         rule_prefix: 规则 ID 前缀
         table_id:   流表 ID
 
     Returns:
-        FlowRule 列表，每个中间交换机一条
+        FlowRule 列表，每个中间交换机一条 + 终点交换机一条
     """
     rules: List[FlowRule] = []
     links = graph.get("links", {})
+
+    # 辅助：构建匹配字段（共享逻辑）
+    def _build_match(in_port: Optional[int]) -> dict:
+        m = {}
+        if in_port is not None:
+            m["in_port"] = in_port
+        if src_mac:
+            m["eth_src"] = src_mac
+        if dst_mac:
+            m["eth_dst"] = dst_mac
+
+        # OpenFlow 1.3 规范：匹配 L3/L4 字段必须满足前置条件 eth_type
+        #   - ipv4_src / ipv4_dst / ip_proto 要求 eth_type = 0x0800 (IPv4)
+        #     (或 0x86dd (IPv6)，本项目仅支持 IPv4)
+        #   - tcp_src / tcp_dst 要求 ip_proto = 6 (TCP)
+        #   - udp_src / udp_dst 要求 ip_proto = 17 (UDP)
+        #   缺少 eth_type 会导致 ovs 返回 OFPET_BAD_MATCH(4) + OFPBMC_BAD_PREREQ(9)
+        has_l3 = bool(src_ip or dst_ip or ip_proto is not None)
+        has_l4 = bool(src_port is not None or dst_port is not None)
+
+        if has_l3:
+            m["eth_type"] = 0x0800  # IPv4
+        if src_ip:
+            m["ipv4_src"] = src_ip
+        if dst_ip:
+            m["ipv4_dst"] = dst_ip
+        if ip_proto is not None:
+            m["ip_proto"] = ip_proto
+        if src_port is not None:
+            m["tcp_src" if ip_proto == 6 else "udp_src"] = src_port
+        if dst_port is not None:
+            m["tcp_dst" if ip_proto == 6 else "udp_dst"] = dst_port
+        return m
 
     for i in range(len(path) - 1):
         sw_dpid = path[i]
@@ -120,39 +157,15 @@ def compile_path_rules(
         if out_port is None:
             continue
 
-        # 构建 match 字段
-        match = {}
-
-        # 查找入端口（除第一跳外）
-        if i > 0:
+        # 入端口
+        in_port = None
+        if i == 0 and first_hop_in_port is not None:
+            in_port = first_hop_in_port
+        elif i > 0:
             prev_dpid = path[i - 1]
-            in_port = _find_out_port(links, prev_dpid, sw_dpid)
-            # 实际上入端口应该是从 prev→sw 链路的 dst_port
-            # 重新查找：我们需要 sw 侧的入端口
             in_port = _find_in_port(links, prev_dpid, sw_dpid)
-            if in_port is not None:
-                match["in_port"] = in_port
-        # 第一跳：入端口从 src_dpid 的边来识别
-        # 通常在首跳，入端口是主机连接的端口，但不从拓扑链路表可查
-        # 暂时不在首跳设置 in_port（由上层根据主机连接信息补全）
 
-        # L2/L3/L4 匹配字段
-        if src_mac:
-            match["eth_src"] = src_mac
-        if dst_mac:
-            match["eth_dst"] = dst_mac
-        if src_ip:
-            match["ipv4_src"] = src_ip
-        if dst_ip:
-            match["ipv4_dst"] = dst_ip
-        if ip_proto is not None:
-            match["ip_proto"] = ip_proto
-        if src_port is not None:
-            match["tcp_src" if ip_proto == 6 else "udp_src"] = src_port
-        if dst_port is not None:
-            match["tcp_dst" if ip_proto == 6 else "udp_dst"] = dst_port
-
-        # 构建动作
+        match = _build_match(in_port)
         actions = [{"type": "OUTPUT", "port": out_port}]
 
         rule = FlowRule(
@@ -165,6 +178,32 @@ def compile_path_rules(
             metadata={"hop": i, "next_dpid": next_dpid, "out_port": out_port},
         )
         rules.append(rule)
+
+    # Bug 8 修复：终点交换机（path[-1]）需要一条规则将包转发到目的主机端口
+    # 否则包到达终点交换机后表未命中 → PacketIn → _try_deploy_flow 发现已下发 → 丢弃
+    if len(path) >= 1 and dst_host_port is not None:
+        last_dpid = path[-1]
+        last_in_port = None
+        if len(path) >= 2:
+            prev_dpid = path[-2]
+            last_in_port = _find_in_port(links, prev_dpid, last_dpid)
+        elif first_hop_in_port is not None:
+            # 路径长度为 1（源和目标在同一交换机）：in_port = first_hop_in_port
+            last_in_port = first_hop_in_port
+
+        last_match = _build_match(last_in_port)
+        last_actions = [{"type": "OUTPUT", "port": dst_host_port}]
+
+        last_rule = FlowRule(
+            rule_id=f"{rule_prefix}_{src_dpid}_{dst_dpid}_hop{len(path)-1}",
+            dpid=last_dpid,
+            priority=priority,
+            match_fields=last_match,
+            actions=last_actions,
+            table_id=table_id,
+            metadata={"hop": len(path) - 1, "dst_host": True, "out_port": dst_host_port},
+        )
+        rules.append(last_rule)
 
     return rules
 

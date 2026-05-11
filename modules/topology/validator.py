@@ -42,7 +42,9 @@ class LLDPValidator:
     """
 
     def __init__(self):
-        self._known_devices: Set[str] = set()
+        self._known_devices: Set[str] = set() 
+        #set表示已知设备的集合，存储 Chassis MAC 地址的十六进制字符串形式（如 "00:11:22:33:44:55"），用于快速检查 LLDP 包中的 ChassisID 是否来自已注册的交换机
+        #里面的元素都是字符串，格式为 "00:11:22:33:44:55"，表示已知设备的 Chassis MAC 地址
         self._total_checked = 0
         self._total_rejected = 0
         self._total_warnings = 0
@@ -50,6 +52,7 @@ class LLDPValidator:
     def register_device(self, chassis_mac: bytes):
         """注册已知设备（交换机连接时调用）"""
         self._known_devices.add(chassis_mac.hex(':'))
+        #hex表示将 bytes 类型的 chassis_mac 转换为十六进制字符串，并用冒号分隔每个字节，例如 b'\x00\x11\x22\x33\x44\x55' 会转换为 "00:11:22:33:44:55"，然后添加到已知设备集合中
 
     def unregister_device(self, chassis_mac: bytes):
         """移除已知设备（交换机断开时调用）"""

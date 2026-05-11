@@ -62,7 +62,8 @@ def dpid_to_mac(dpid: int) -> bytes:
         6 字节 MAC 地址
     """
     return struct.pack("!Q", dpid)[2:]  # 取低 6 字节
-
+    #struct表示将 Python 数据类型转换为字节序列，!Q 表示网络字节序的无符号长整数（8 字节），然后通过切片 [2:] 取出低 6 字节作为 MAC 地址
+    #pack表示将 dpid 转换为 8 字节的字节序列，!Q 表示网络字节序的无符号长整数（8 字节），然后通过切片 [2:] 取出低 6 字节作为 MAC 地址
 
 def mac_to_dpid(mac: bytes) -> int:
     """

@@ -33,7 +33,7 @@ class RingBuffer:
             capacity: 缓冲区最大容量
             name: 缓冲区名称（用于日志）
         """
-        self._deque = collections.deque(maxlen=capacity)
+        self._deque = collections.deque(maxlen=capacity) #双端队列，设置最大长度为 capacity，超过时自动丢弃最旧元素
         self._lock = threading.Lock()       # 仅保护 push 端
         self._not_empty = threading.Condition(threading.Lock())  #消费者等待新数据的条件变量
         self._capacity = capacity
@@ -55,18 +55,18 @@ class RingBuffer:
         Returns:
             True 表示成功写入，False 表示因满而丢弃
         """
-        dropped = False
+        dropped = False  #标志位，表示是否因为缓冲区已满而丢弃了最旧的消息，初始值为 False，表示没有丢弃任何消息
         with self._lock:
             if len(self._deque) >= self._capacity:
                 # 满时丢弃最旧消息
-                self._deque.popleft()
-                self.total_dropped += 1
-                dropped = True
-            self._deque.append(item)
-            self.total_pushed += 1
+                self._deque.popleft() #从双端队列的左侧（最旧消息）弹出一个元素，即丢弃最旧的消息
+                self.total_dropped += 1 #丢弃计数加1
+                dropped = True #将 dropped 标志设置为 True，表示已经丢弃了最旧的消息
+            self._deque.append(item) #将新的消息添加到双端队列的右侧（最新消息）
+            self.total_pushed += 1 #入队计数加1
 
-        # 通知消费者有新数据
-        with self._not_empty:
+        # 通知消费者有新数据，问题：无效唤醒会很多，是否需要优化？（目前不做复杂优化，保持简单）
+        with self._not_empty:  #with的作用是自动获取和释放锁，这里是获取 self._not_empty 条件变量的锁，以确保在通知消费者之前，生产者线程已经完成了对缓冲区的修改，避免竞争条件
             self._not_empty.notify()
 
         return not dropped

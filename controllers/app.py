@@ -1,21 +1,23 @@
 """
-Ryu 主控制器 — 集成消息队列架构 + 拓扑发现 + 性能检测 (Phase 2.5 多线程)
+Ryu 主控制器 — 集成消息队列架构 + 拓扑发现 + 性能检测 + 路由下发 (Phase 4)
 
 数据流：
   PacketIn → SecurityFilter(前置) → TransparentProxy(元数据分类)
     ├─ 东向 (LLDP/拓扑探测) → Ring Buffer → Dispatcher(异步) → Workers → topo_east_queue + perf_east_queue
-    └─ 西向 (ARP/IP/首包)   → Dispatcher.dispatch(快通道) → Workers → west_queue
+    └─ 西向 (ARP/IP/首包)   → 主控直推 → arp_queue → ArpHandler（首包触发路由查找 + 流表下发）
+         └─ IP 同时 fan-out → perf_east_queue（PerformanceMonitor ICMP RTT 匹配）
 
-下游消费（fan-out 修复）：
-  topo_east_queue → 拓扑发现模块 (LLDP 采集 + 拓扑处理)
-  perf_east_queue → 性能检测模块 (四指标 + 拥堵等级)
-  west_queue → 路由管理模块 (Phase 4)
+下游消费：
+  topo_east_queue → 拓扑发现模块 (LLDP 采集 + 拥堵等级)
+  arp_queue       → ArpHandler (ARP 学习 + 首包路由触发 + 精确流表下发)
+  perf_east_queue → 性能检测模块 (四指标 + ICMP RTT)
 
 多线程架构：
   - Dispatcher 线程 × 1: pop(RingBuffer) → hash → put(Worker.input_queue)
-  - Worker 线程 × 3: get(input_queue) → 过滤/解析 → put(topo_east + perf_east + west)
+  - Worker 线程 × 3: get(input_queue) → 过滤/解析 → put(topo_east + perf_east)
   - TopologyConsumer 线程 × 1: get(topo_east) → process_structured_message()
   - PerfMonitor 线程 × 1: get(perf_east) → 字节累积 + ICMP 匹配
+  - ArpHandler 线程 × 1: get(arp_queue) → ARP 处理 + 路由触发 + 流表下发
   - LLDP 定时器 (eventlet): 100ms 排空下行队列 + 发送周期
 """
 
@@ -23,6 +25,8 @@ import sys
 import os
 import time
 import threading
+import queue
+import struct
 
 # ryu-manager 将 controllers/app.py 作为独立文件加载，
 # 需手动将项目根目录加入 sys.path 以解析 controllers.* 和 modules.* 包
@@ -41,6 +45,7 @@ from controllers.transparent_proxy import TransparentProxy
 from controllers.security_filter import SecurityFilter
 from modules.message_queue.ring_buffer import RingBuffer
 from modules.message_queue.dispatcher import Dispatcher
+from modules.message_queue.worker import StructuredMessage
 from modules.topology.collector import LLDPCollector
 from modules.topology.processor import TopologyProcessor
 from modules.topology.lldp_utils import dpid_to_mac
@@ -49,8 +54,8 @@ from storage.redis_client import RedisClient
 from storage.mysql_client import MySQLClient, MySQLWriterThread
 from modules.stalker.stalker_manager import StalkerManager
 from modules.routing.route_manager import RouteManager
+from modules.routing.arp_handler import ArpHandler
 from modules.flow_table.deployer import DatapathRegistry, FlowDeployer
-from modules.flow_table.compiler import compile_p0_rules, compile_p1_rules
 
 
 class SDNController(app_manager.RyuApp):
@@ -134,6 +139,22 @@ class SDNController(app_manager.RyuApp):
         # 启动 LLDP 下行排空定时器（主控线程安全发送 PacketOut）
         self._start_lldp_drain_timer()
 
+        # ── Phase 4: ARP 处理机专用队列（主控直推，不经过 Worker 流水线） ──
+        self.arp_queue = queue.Queue(maxsize=10000)
+
+        # ── Phase 4: ARP 处理机（西向队列消费者，首包触发路由查找） ──
+        # 必须在 topology_processor 初始化之后创建（需要引用 topology_processor.graph）
+        self.arp_handler = ArpHandler(
+            west_queues=[self.arp_queue],
+            dp_registry=self.dp_registry,
+            route_manager=self.route_manager,
+            flow_deployer=self.flow_deployer,
+            topology_graph=self.topology_processor.graph,
+            logger=self.logger,
+        )
+        self.arp_handler.start()
+        self.logger.info("📡 Phase 4: ArpHandler started (direct west-queue consumer)")
+
         # 启动拓扑消费线程（从 topo_east_queue 消费 LLDP 消息送入 processor）
         self._start_topology_consumer()
 
@@ -155,10 +176,11 @@ class SDNController(app_manager.RyuApp):
         self.route_manager.set_perf_monitor(self.perf_monitor)
         self.route_manager.set_redis_client(self.redis_client)
 
-        # ── Phase 4: 路由 → 编译 → 下发 闭环回调 ──
-        # 拓扑变更 → recompute_all() → 自动编译路径并下发流表到交换机
+        # ── Phase 4: 路由 → 拓扑变更回调（仅记录，不下发流表） ──
+        # 拓扑变更 → recompute_all() → 缓存路由到内存。
+        # 实际流表下发延迟到 ArpHandler 收到首包时：ARP 学习 → 查缓存 → 精确编译 → 下发
         self.route_manager.set_on_routes_updated(self._on_routes_updated)
-        self.logger.info("🔄 Phase 4: RouteManager dependency injection + flow deploy callback registered")
+        self.logger.info("🔄 Phase 4: RouteManager dependency injection + topology-change callback registered")
 
         # ── 统计定时器 ──
         self._last_stats_time = time.time()
@@ -171,31 +193,35 @@ class SDNController(app_manager.RyuApp):
                          f"+ {len(self.dispatcher.workers)} worker threads "
                          f"(total {1 + len(self.dispatcher.workers)} threads)")
         self.logger.info("📍 东向通道(fan-out): PacketIn → RingBuffer → Dispatcher → Workers → topo_east + perf_east")
-        self.logger.info("📍 西向通道: PacketIn → Dispatcher.dispatch() → Workers → west_queue")
+        self.logger.info("📍 西向通道: PacketIn → 主控直推 → arp_queue → ArpHandler (首包触发路由)")
         self.logger.info("📍 拓扑发现: LLDPCollector + TopologyProcessor (topo_east_queue)")
         self.logger.info("📍 存储: Redis (快照+version) + MySQL (changelog + perf 异步批量写入)")
         self.logger.info("📍 性能检测: PerformanceMonitor (perf_east_queue)")
         self.logger.info("=" * 60)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)  # type: ignore[attr-defined]
-    def switch_features_handler(self, ev):
-        datapath = ev.msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        dpid = datapath.id
+    # SwitchFeatures 事件处理器：安装默认流表 + 注册交换机到 LLDP 采集器 + 注册 datapath 到流表下发注册表
+    #datapath 表示一个交换机对象，包含了交换机的连接信息和通信接口。每当一个交换机连接到控制器时，Ryu 会触发一个 SwitchFeatures 事件，并将该交换机的 datapath 对象作为事件参数传递给事件处理器。
+    def switch_features_handler(self, ev): 
+        datapath = ev.msg.datapath # 获取交换机连接的 datapath 对象，msg表示事件消息，datapath 属性包含了交换机的连接信息和通信接口
+        ofproto = datapath.ofproto # 获取 OpenFlow 协议相关常量和类
+        parser = datapath.ofproto_parser # parser表示一个用于构造 OpenFlow 消息的对象，提供了各种方法来创建不同类型的 OpenFlow 消息，例如 FlowMod、PacketOut 等
+        dpid = datapath.id # 获取交换机的 DPID（Datapath ID），这是一个唯一标识交换机的 64 位整数，通常以十六进制格式表示
 
         # 默认流表：所有包上送控制器
-        match = parser.OFPMatch()
+        match = parser.OFPMatch() # 创建一个空的匹配对象，表示匹配所有流量，ofpmatch表示OpenFlow 匹配结构（用来描述"匹配什么条件的包"）
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        #动作为列表，因为一个流表可以有多action，OFPActionOutput表示发往哪个端口，这里是OFPP_CONTROLLER，表示发送到控制器，OFPCML_NO_BUFFER表示不缓存数据包，直接发送完整数据包到控制器
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        #OFPIT_APPLY_ACTIONS表示立即执行动作，inst创建指令列表，这里只有一个指令，即应用上面定义的动作列表
 
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=0,
-            match=match,
-            instructions=inst
+        mod = parser.OFPFlowMod( #创建一个流表修改消息
+            datapath=datapath, #指定要下发流表的交换机
+            priority=0, #流表优先级，0表示最低优先级，匹配所有流量
+            match=match, #匹配条件，这里是空的，表示匹配所有流量
+            instructions=inst #流表指令，这里是应用上面定义的动作列表，即将匹配的流量发送到控制器
         )
-        datapath.send_msg(mod)
+        datapath.send_msg(mod) #将流表修改消息发送到交换机，安装默认流表项，确保所有未匹配的流量都会被发送到控制器进行处理
 
         # ── Phase 2: 注册交换机到 LLDP 采集器 ──
         self.lldp_collector.register_switch(dpid, datapath)
@@ -206,14 +232,15 @@ class SDNController(app_manager.RyuApp):
         # ── Phase 4: 注册 datapath 到流表下发注册表 ──
         self.dp_registry.register(dpid, datapath)
 
-        self.logger.info(f"🔌 Switch {dpid:016x} connected (LLDP + FlowTable registered)")
+        self.logger.info(f"🔌 交换机 {dpid:016x} 已经连接到 (LLDP + FlowTable registered)")
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)  # type: ignore[attr-defined]
+    # PacketIn 事件处理器：前置安全过滤 → 透传代理分类 → 东向 RingBuffer / 西向 ArpHandler
     def packet_in_handler(self, ev):
-        msg = ev.msg
+        msg = ev.msg #事件消息对象，包含了 PacketIn 事件的详细信息，例如接收到的数据包、匹配的流表项、输入端口等
         datapath = msg.datapath
 
-        # ── 1. 前置安全过滤（包大小超限等快速拒绝） ──
+        # 主控上的安全过滤（快速检查包大小，避免明显无效包进入 Ring Buffer）
         if not self.security_filter.filter(msg):
             return
 
@@ -223,18 +250,67 @@ class SDNController(app_manager.RyuApp):
         # ── 3. 路由到消息队列 ──
         if msg_type == TransparentProxy.TYPE_EAST:
             # 东向：写入 Ring Buffer → Dispatcher 线程异步消费
-            ok = self.ring_buffer.push(msg)
+            ok = self.ring_buffer.push(msg) 
             if not ok:
                 self.logger.debug(
                     f"[EAST] Ring Buffer full, oldest dropped | "
                     f"dpid={datapath.id:016x}"
                 )
         else:
-            # 西向：Dispatcher 快通道（直接分发，不经过 Ring Buffer）
-            self.dispatcher.dispatch(msg)
+            # 西向快通道：主控直接构造 StructuredMessage 送入 ArpHandler
+            # 不经过 Dispatcher/Worker 流水线（架构修正）
+            raw_data = msg.data
+            if raw_data and len(raw_data) >= 14:
+                ethertype = struct.unpack("!H", raw_data[12:14])[0]
+
+                # Bug 6 修复：LLDP 帧 (0x88CC) metadata 不跨网络传播，
+                # 邻居交换机收到的 LLDP PacketIn 无 metadata 标记会被误判为西向。
+                # 必须按 ethertype 重定向到东向 RingBuffer → Worker → topo_east_queue。
+                if ethertype == 0x88CC:
+                    ok = self.ring_buffer.push(msg)
+                    if not ok:
+                        self.logger.debug("[LLDP-REROUTE] Ring Buffer full, LLDP dropped")
+                    return
+
+                if ethertype == 0x0806:
+                    sm_type = StructuredMessage.TYPE_ARP
+                elif ethertype in (0x0800, 0x86DD):
+                    sm_type = StructuredMessage.TYPE_IP
+                else:
+                    sm_type = StructuredMessage.TYPE_OTHER
+
+                try:
+                    dpid = msg.datapath.id
+                except Exception:
+                    dpid = 0
+                try:
+                    in_port = msg.match.get('in_port', 0) if msg.match else 0
+                except Exception:
+                    in_port = 0
+
+                structured = StructuredMessage(
+                    msg_type=sm_type,
+                    dpid=dpid,
+                    in_port=in_port,
+                    data=raw_data,
+                )
+
+                # 推入 ArpHandler 专用队列（首包触发路由查找 + 流表下发）
+                try:
+                    self.arp_queue.put_nowait(structured)
+                except queue.Full:
+                    pass
+
+                # IP 包同时推入性能检测队列（PerformanceMonitor ICMP 匹配）
+                if sm_type == StructuredMessage.TYPE_IP:
+                    for q in self.get_perf_east_queues():
+                        try:
+                            q.put_nowait(structured)
+                        except queue.Full:
+                            pass
 
         # ── 4. 定期输出统计（每 1000 包） ──
-        total = self.ring_buffer.total_pushed + self.dispatcher.stats()['dispatcher']['west_dispatched']
+        total = self.ring_buffer.total_pushed
         if total % 1000 == 0:
             self._log_stats()
 
@@ -251,8 +327,8 @@ class SDNController(app_manager.RyuApp):
         self.logger.info(
             f"📊 Stats | ring: {rb['current_size']}/{rb['capacity']} "
             f"pushed={rb['total_pushed']} dropped={rb['total_dropped']} | "
-            f"dispatched: east={ds['dispatcher']['east_dispatched']} "
-            f"west={ds['dispatcher']['west_dispatched']} | "
+            f"east_dispatched={ds['dispatcher']['east_dispatched']} | "
+            f"arp_queue={self.arp_queue.qsize()} | "
             f"workers: {[w['total_handled'] for w in ds['workers']]}"
         )
 
@@ -297,6 +373,18 @@ class SDNController(app_manager.RyuApp):
             f"ICMP matched={perf_stats['total_icmp_matched']}, "
             f"active_links={perf_stats['active_links']}, "
             f"levels={perf_stats['detector']['level_distribution']}"
+        )
+
+        arp_stats = self.arp_handler.stats()
+        self.logger.info(
+            f"📊 [Phase 4] ArpHandler: arp={arp_stats['arp_handled']} "
+            f"ip={arp_stats['ip_handled']} "
+            f"replies_sent={arp_stats['arp_replies_sent']} "
+            f"replies_fwd={arp_stats['arp_replies_fwd']} "
+            f"floods={arp_stats['floods']} "
+            f"floods_deduped={arp_stats['floods_deduped']} "
+            f"flows={arp_stats['flows_deployed']} "
+            f"hosts={arp_stats['hosts_learned']}"
         )
 
         self.logger.info(
@@ -396,77 +484,30 @@ class SDNController(app_manager.RyuApp):
 
     def _on_routes_updated(self, summary: dict):
         """
-        RouteManager 重算完成后的回调 — 将路由编译为流表并下发到交换机。
+        RouteManager 重算完成后的回调 — 仅记录日志，不下发流表。
 
-        管线：
-          RouteManager.recompute_all()
-            → self._on_routes_updated(summary)
-              → 遍历缓存 → compile_p0_rules / compile_p1_rules
-                → FlowDeployer.deploy_rules()
-                  → OFPFlowMod → datapath.send_msg()
+        拓扑变更时 RouteManager 预计算所有路由对并缓存到内存中。
+        实际流表下发延迟到 ArpHandler 收到首包时：
+          ArpHandler._try_deploy_flow() → 查 RouteManager 缓存
+            → compile_path_rules(带 MAC/IP/in_port 精确匹配)
+              → FlowDeployer.deploy_rules()
+
+        这避免了此前「拓扑变更时生成 match={} 通配规则（priority=100）
+        劫持所有流量」的 Bug。
+
+        管线对比：
+          ❌ 旧: 拓扑变更 → compile_p0/p1(无匹配字段) → deploy(通配规则 hijack 所有流量)
+          ✅ 新: 拓扑变更 → recompute_all() 入缓存（仅内存）
+                 → 首包 → ArpHandler → 查缓存 → compile(精确 MAC/IP/in_port) → deploy
 
         Args:
             summary: RouteManager.recompute_all() 的返回 dict
         """
-        graph = self.topology_processor.get_topology()
         routes = self.route_manager.get_all_routes()
 
-        total_deployed = 0
-        total_failed = 0
-
-        for (src, dst), entry in routes.items():
-            for profile, result in entry.get("profiles", {}).items():
-                try:
-                    if result.get("is_p0"):
-                        p0 = result.get("p0", {})
-                        primary = p0.get("primary")
-                        backup = p0.get("backup")
-
-                        if primary and primary.path:
-                            if backup and backup.path:
-                                # P0 双路径：编译并下发
-                                primary_rules, backup_rules = compile_p0_rules(
-                                    primary.path, backup.path, graph, src, dst,
-                                )
-                                dep, fail = self.flow_deployer.deploy_p0_paths(
-                                    primary_rules, backup_rules,
-                                )
-                                total_deployed += dep
-                                total_failed += fail
-                            else:
-                                # P0 仅有主路径（fallback）
-                                primary_rules = compile_p1_rules(
-                                    primary.path, graph, src, dst,
-                                )
-                                dep, fail = self.flow_deployer.deploy_p1_path(
-                                    primary_rules,
-                                )
-                                total_deployed += dep
-                                total_failed += fail
-                    else:
-                        p1 = result.get("p1", {})
-                        primary = p1.get("primary")
-
-                        if primary and primary.path:
-                            primary_rules = compile_p1_rules(
-                                primary.path, graph, src, dst,
-                            )
-                            dep, fail = self.flow_deployer.deploy_p1_path(
-                                primary_rules,
-                            )
-                            total_deployed += dep
-                            total_failed += fail
-
-                except Exception:
-                    self.logger.exception(
-                        f"[FlowDeploy] Failed to deploy {profile} route "
-                        f"{src}→{dst}"
-                    )
-                    total_failed += 1
-
         self.logger.info(
-            f"[FlowDeploy] Route update deployed: "
-            f"{total_deployed} rules OK, {total_failed} failed "
+            f"[FlowDeploy] Topology changed — route cache updated "
             f"(routes={summary.get('routes', 0)} "
-            f"switches={summary.get('switches', 0)})"
+            f"switches={summary.get('switches', 0)}). "
+            f"Flow rules will be deployed on first packet by ArpHandler."
         )

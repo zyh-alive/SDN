@@ -95,7 +95,7 @@ class FlowDeployer:
             dp_registry:  交换机 datapath 注册表
             logger:       日志记录器
         """
-        self._dp_registry = dp_registry or DatapathRegistry()
+        self._dp_registry = dp_registry if dp_registry is not None else DatapathRegistry()
         self.logger = logger or logging.getLogger(__name__)
 
         # 已下发规则追踪：{(dpid, cookie, table_id): [rule_ids]}

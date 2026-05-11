@@ -8,7 +8,7 @@
 
 分类规则：
   1. metadata == TYPE_EAST (1) → 东向 — 采集数据（LLDP 探测 / IP 性能采集），走 Ring Buffer 削峰
-  2. metadata != TYPE_EAST (默认 0) → 西向 — 首包数据（ARP/IP 未标记包），直入 west_queue
+  2. metadata != TYPE_EAST (默认 0) → 西向 — 首包数据（ARP/IP 未标记包），直入 arphandler
 
 metadata 来源：
   LLDPCollector 下发 PacketOut 时通过 OFPActionSetField(metadata=1) 打标签。
@@ -29,7 +29,7 @@ class TransparentProxy:
         根据 metadata 字段判断消息方向（传输通道选择）
 
         东向 (TYPE_EAST=1): metadata==1 → LLDP 探测回升包 / IP 采集包 → Ring Buffer
-        西向 (TYPE_WEST=2): metadata!=1 → 普通 ARP/IP 首包 → 直通 west_queue（不经过 Ring Buffer/Worker）
+        西向 (TYPE_WEST=2): metadata!=1 → 普通 ARP/IP 首包 → 直通 arphandler
 
         Args:
             msg: Ryu PacketIn 消息对象 (ev.msg)
@@ -38,6 +38,7 @@ class TransparentProxy:
             TYPE_EAST (1) 或 TYPE_WEST (2)
         """
         metadata = msg.match.get('metadata', 0) if msg.match else 0
+        #get('metadata', 0)这里面的0为默认值，走西向通道
         if metadata == self.TYPE_EAST:
             return self.TYPE_EAST
         return self.TYPE_WEST
