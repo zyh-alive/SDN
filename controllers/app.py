@@ -49,6 +49,8 @@ from storage.redis_client import RedisClient
 from storage.mysql_client import MySQLClient, MySQLWriterThread
 from modules.stalker.stalker_manager import StalkerManager
 from modules.routing.route_manager import RouteManager
+from modules.flow_table.deployer import DatapathRegistry, FlowDeployer
+from modules.flow_table.compiler import compile_p0_rules, compile_p1_rules
 
 
 class SDNController(app_manager.RyuApp):
@@ -113,6 +115,11 @@ class SDNController(app_manager.RyuApp):
         self.stalker_manager.register(self.route_manager, wake_order=0)
         self.logger.info("📡 Phase 3: StalkerManager + RouteManager registered")
 
+        # ── Phase 4: 流表下发基础设施 ──
+        self.dp_registry = DatapathRegistry()
+        self.flow_deployer = FlowDeployer(dp_registry=self.dp_registry, logger=self.logger)
+        self.logger.info("📋 Phase 4: FlowDeployer + DatapathRegistry initialized")
+
         # ── Phase 2: 拓扑发现模块 ──
         self.lldp_collector = LLDPCollector(logger=self.logger)
         self.topology_processor = TopologyProcessor(logger=self.logger,
@@ -140,6 +147,18 @@ class SDNController(app_manager.RyuApp):
 
         # 启动性能监控
         self.perf_monitor.start()
+
+        # ── Phase 4: RouteManager 依赖注入（拓扑 + 性能 + Redis） ──
+        # 必须在 perf_monitor 初始化之后执行，否则 set_perf_monitor 传入 None
+        # RouteManager 需要拓扑图谱用于 KSP 算法、性能数据用于惩罚、Redis 用于缓存储存
+        self.route_manager.set_topology_graph(self.topology_processor.graph)
+        self.route_manager.set_perf_monitor(self.perf_monitor)
+        self.route_manager.set_redis_client(self.redis_client)
+
+        # ── Phase 4: 路由 → 编译 → 下发 闭环回调 ──
+        # 拓扑变更 → recompute_all() → 自动编译路径并下发流表到交换机
+        self.route_manager.set_on_routes_updated(self._on_routes_updated)
+        self.logger.info("🔄 Phase 4: RouteManager dependency injection + flow deploy callback registered")
 
         # ── 统计定时器 ──
         self._last_stats_time = time.time()
@@ -184,7 +203,10 @@ class SDNController(app_manager.RyuApp):
         # 同步预注册到拓扑校验器（避免"先有鸡还是先有蛋"死锁）
         self.topology_processor.validator.register_device(dpid_to_mac(dpid))
 
-        self.logger.info(f"🔌 Switch {dpid:016x} connected (LLDP registered)")
+        # ── Phase 4: 注册 datapath 到流表下发注册表 ──
+        self.dp_registry.register(dpid, datapath)
+
+        self.logger.info(f"🔌 Switch {dpid:016x} connected (LLDP + FlowTable registered)")
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)  # type: ignore[attr-defined]
     def packet_in_handler(self, ev):
@@ -367,3 +389,84 @@ class SDNController(app_manager.RyuApp):
                 "congestion_level": levels.get(link_id, 0),
             }
         return result
+
+    # ──────────────────────────────────────────────
+    # Phase 4: 路由 → 编译 → 下发 闭环
+    # ──────────────────────────────────────────────
+
+    def _on_routes_updated(self, summary: dict):
+        """
+        RouteManager 重算完成后的回调 — 将路由编译为流表并下发到交换机。
+
+        管线：
+          RouteManager.recompute_all()
+            → self._on_routes_updated(summary)
+              → 遍历缓存 → compile_p0_rules / compile_p1_rules
+                → FlowDeployer.deploy_rules()
+                  → OFPFlowMod → datapath.send_msg()
+
+        Args:
+            summary: RouteManager.recompute_all() 的返回 dict
+        """
+        graph = self.topology_processor.get_topology()
+        routes = self.route_manager.get_all_routes()
+
+        total_deployed = 0
+        total_failed = 0
+
+        for (src, dst), entry in routes.items():
+            for profile, result in entry.get("profiles", {}).items():
+                try:
+                    if result.get("is_p0"):
+                        p0 = result.get("p0", {})
+                        primary = p0.get("primary")
+                        backup = p0.get("backup")
+
+                        if primary and primary.path:
+                            if backup and backup.path:
+                                # P0 双路径：编译并下发
+                                primary_rules, backup_rules = compile_p0_rules(
+                                    primary.path, backup.path, graph, src, dst,
+                                )
+                                dep, fail = self.flow_deployer.deploy_p0_paths(
+                                    primary_rules, backup_rules,
+                                )
+                                total_deployed += dep
+                                total_failed += fail
+                            else:
+                                # P0 仅有主路径（fallback）
+                                primary_rules = compile_p1_rules(
+                                    primary.path, graph, src, dst,
+                                )
+                                dep, fail = self.flow_deployer.deploy_p1_path(
+                                    primary_rules,
+                                )
+                                total_deployed += dep
+                                total_failed += fail
+                    else:
+                        p1 = result.get("p1", {})
+                        primary = p1.get("primary")
+
+                        if primary and primary.path:
+                            primary_rules = compile_p1_rules(
+                                primary.path, graph, src, dst,
+                            )
+                            dep, fail = self.flow_deployer.deploy_p1_path(
+                                primary_rules,
+                            )
+                            total_deployed += dep
+                            total_failed += fail
+
+                except Exception:
+                    self.logger.exception(
+                        f"[FlowDeploy] Failed to deploy {profile} route "
+                        f"{src}→{dst}"
+                    )
+                    total_failed += 1
+
+        self.logger.info(
+            f"[FlowDeploy] Route update deployed: "
+            f"{total_deployed} rules OK, {total_failed} failed "
+            f"(routes={summary.get('routes', 0)} "
+            f"switches={summary.get('switches', 0)})"
+        )
