@@ -15,7 +15,7 @@ LLDP 采集器 — 定期生成 LLDP 包并通过 PacketOut 下发给交换机
 
 import time
 import threading
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .lldp_utils import dpid_to_mac, build_lldp_frame, DEFAULT_TTL
 
@@ -64,7 +64,7 @@ class LLDPCollector:
 
         # LLDP 发送回调（注入 PerformanceMonitor.on_lldp_sent）
         # 每次构造 LLDP 帧时调用，传入 (dpid, port_no) 供性能检测记录时间戳
-        self.on_lldp_sent_callback = None
+        self.on_lldp_sent_callback: Optional[Callable[[int, int], None]] = None
 
         # 统计
         self._total_lldp_sent = 0

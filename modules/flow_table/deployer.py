@@ -455,8 +455,8 @@ if __name__ == "__main__":
 
     # ── 测试 4：deploy_rules ──
     rules = [
-        FlowRule("r1", 1, 100, {"in_port": 1}, [{"type": "OUTPUT", "port": 2}]),
-        FlowRule("r2", 2, 100, {"in_port": 2}, [{"type": "OUTPUT", "port": 1}]),
+        FlowRule(rule_id="r1", dpid=1, priority=100, match_fields={"in_port": 1}, actions=[{"type": "OUTPUT", "port": 2}]),  # type: ignore[call-arg]
+        FlowRule(rule_id="r2", dpid=2, priority=100, match_fields={"in_port": 2}, actions=[{"type": "OUTPUT", "port": 1}]),  # type: ignore[call-arg]
     ]
     deployed, failed = deployer.deploy_rules(rules, cookie=0x1000, check_conflicts=False)
     assert deployed == 2
