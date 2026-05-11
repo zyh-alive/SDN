@@ -1,23 +1,31 @@
 """
 Ryu 主控制器 — 集成消息队列架构 + 拓扑发现 + 性能检测 + 路由下发 (Phase 4)
 
-数据流：
-  PacketIn → SecurityFilter(前置) → TransparentProxy(元数据分类)
-    ├─ 东向 (LLDP/拓扑探测) → Ring Buffer → Dispatcher(异步) → Workers → topo_east_queue + perf_east_queue
-    └─ 西向 (ARP/IP/首包)   → 主控直推 → arp_queue → ArpHandler（首包触发路由查找 + 流表下发）
-         └─ IP 同时 fan-out → perf_east_queue（PerformanceMonitor ICMP RTT 匹配）
+数据流（ethertype 直接分向，无 metadata 依赖）：
+  PacketIn → SecurityFilter(前置) → 按 EtherType 分向
+    ├─ 东向 LLDP (0x88CC) → Ring Buffer → Dispatcher → Workers
+    │     ├─ topo_east_queue → 拓扑发现模块 (LLDP 链路绘制)
+    │     └─ perf_east_queue → 性能检测模块 (LLDP 时间戳 → 时延 + 丢包率)
+    └─ 西向 ARP/IP (0x0806/0x0800/0x86DD) → 主控直推 → arp_queue
+          └─ ArpHandler (ARP 学习 + 首包路由触发 + 流表下发)
+
+性能检测采用设计文档方案（PULL 模式）：
+  - 吞吐量: STATS_REQUEST 轮询交换机端口字节计数器 (b1-b2)*8/t
+  - 时延: LLDP PacketIn 时间戳 (t1+t2-t3-t4)/2
+  - 抖动: 连续时延差值 |d1-d2|
+  - 丢包率: LLDP 发送/接收计数 (x-y)/x
 
 下游消费：
-  topo_east_queue → 拓扑发现模块 (LLDP 采集 + 拥堵等级)
-  arp_queue       → ArpHandler (ARP 学习 + 首包路由触发 + 精确流表下发)
-  perf_east_queue → 性能检测模块 (四指标 + ICMP RTT)
+  topo_east_queue → 拓扑发现模块 (LLDP 链路绘制)
+  perf_east_queue → 性能检测模块 (LLDP 时间戳 + STATS_REPLY → 四指标)
+  arp_queue       → ArpHandler (ARP 学习 + 首包路由触发 + 流表下发)
 
 多线程架构：
   - Dispatcher 线程 × 1: pop(RingBuffer) → hash → put(Worker.input_queue)
   - Worker 线程 × 3: get(input_queue) → 过滤/解析 → put(topo_east + perf_east)
   - TopologyConsumer 线程 × 1: get(topo_east) → process_structured_message()
-  - PerfMonitor 线程 × 1: get(perf_east) → 字节累积 + ICMP 匹配
-  - ArpHandler 线程 × 1: get(arp_queue) → ARP 处理 + 路由触发 + 流表下发
+  - PerfMonitor 线程 × 1: get(perf_east) → LLDP 时延提取 + STATS_REPLY 处理
+  - ArpHandler 线程 × 1: get(arp_queue) → ARP 处理 + IP 首包路由触发 + 流表下发
   - LLDP 定时器 (eventlet): 100ms 排空下行队列 + 发送周期
 """
 
@@ -41,7 +49,6 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
 
-from controllers.transparent_proxy import TransparentProxy
 from controllers.security_filter import SecurityFilter
 from modules.message_queue.ring_buffer import RingBuffer
 from modules.message_queue.dispatcher import Dispatcher
@@ -67,8 +74,11 @@ class SDNController(app_manager.RyuApp):
         # ── 前置安全过滤（包大小等基础检查） ──
         self.security_filter = SecurityFilter(self.logger)
 
-        # ── 透传代理（元数据分类：东向/西向） ──
-        self.proxy = TransparentProxy(self)
+        # ── EtherType 常量（直接分向，替代 metadata 分类） ──
+        self.ETHERTYPE_LLDP = 0x88CC
+        self.ETHERTYPE_ARP = 0x0806
+        self.ETHERTYPE_IPV4 = 0x0800
+        self.ETHERTYPE_IPV6 = 0x86DD
 
         # ── SPSC Ring Buffer（东向通道：主控 → Dispatcher） ──
         self.ring_buffer = RingBuffer(capacity=4096, name="EastRingBuffer")
@@ -161,13 +171,22 @@ class SDNController(app_manager.RyuApp):
         # 启动 LLDP 采集器（定期发送 LLDP）
         self.lldp_collector.start()
 
-        # ── Phase 2: 性能检测模块（fan-out 修复：使用独立 perf_east_queue） ──
+        # ── Phase 2: 性能检测模块（LLDP 时延 + STATS_REQUEST 吞吐量） ──
         perf_queues = self.get_perf_east_queues()
-        self.perf_monitor = PerformanceMonitor(perf_queues, logger=self.logger,
+        self.perf_monitor = PerformanceMonitor(perf_queues,
+                                                lldp_collector=self.lldp_collector,
+                                                dp_registry=self.dp_registry,
+                                                logger=self.logger,
                                                 mysql_writer=self.perf_writer)
 
         # 启动性能监控
         self.perf_monitor.start()
+
+        # ── 注入 LLDP 发送回调：每次 LLDPCollector 发包时通知 PerformanceMonitor ──
+        self.lldp_collector.on_lldp_sent_callback = self.perf_monitor.on_lldp_sent
+
+        # ── 启动 STATS_REQUEST 排空定时器（hub.spawn 协程） ──
+        hub.spawn(self._stats_request_loop)
 
         # ── Phase 4: RouteManager 依赖注入（拓扑 + 性能 + Redis） ──
         # 必须在 perf_monitor 初始化之后执行，否则 set_perf_monitor 传入 None
@@ -192,11 +211,12 @@ class SDNController(app_manager.RyuApp):
         self.logger.info(f"📍 Dispatcher: {len(self.dispatcher.workers)} workers "
                          f"+ {len(self.dispatcher.workers)} worker threads "
                          f"(total {1 + len(self.dispatcher.workers)} threads)")
-        self.logger.info("📍 东向通道(fan-out): PacketIn → RingBuffer → Dispatcher → Workers → topo_east + perf_east")
-        self.logger.info("📍 西向通道: PacketIn → 主控直推 → arp_queue → ArpHandler (首包触发路由)")
+        self.logger.info("📍 东向通道: PacketIn(LLDP/0x88CC) → RingBuffer → Dispatcher → Workers → topo_east + perf_east")
+        self.logger.info("📍 西向通道: PacketIn(ARP/IP) → 主控直推 → arp_queue → ArpHandler (首包触发路由)")
+        self.logger.info("📍 分向策略: EtherType 直接分向（无 metadata 依赖）")
         self.logger.info("📍 拓扑发现: LLDPCollector + TopologyProcessor (topo_east_queue)")
         self.logger.info("📍 存储: Redis (快照+version) + MySQL (changelog + perf 异步批量写入)")
-        self.logger.info("📍 性能检测: PerformanceMonitor (perf_east_queue)")
+        self.logger.info("📍 性能检测: PerformanceMonitor (LLDP时延 + STATS_REQUEST吞吐量, perf_east_queue)")
         self.logger.info("=" * 60)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)  # type: ignore[attr-defined]
@@ -235,7 +255,7 @@ class SDNController(app_manager.RyuApp):
         self.logger.info(f"🔌 交换机 {dpid:016x} 已经连接到 (LLDP + FlowTable registered)")
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)  # type: ignore[attr-defined]
-    # PacketIn 事件处理器：前置安全过滤 → 透传代理分类 → 东向 RingBuffer / 西向 ArpHandler
+    # PacketIn 事件处理器：EtherType 直接分向（LLDP→东向 RingBuffer, ARP/IP→西向 ArpHandler）
     def packet_in_handler(self, ev):
         msg = ev.msg #事件消息对象，包含了 PacketIn 事件的详细信息，例如接收到的数据包、匹配的流表项、输入端口等
         datapath = msg.datapath
@@ -244,70 +264,49 @@ class SDNController(app_manager.RyuApp):
         if not self.security_filter.filter(msg):
             return
 
-        # ── 2. 元数据分类（东向 / 西向） ──
-        msg_type = self.proxy.classify_by_metadata(msg)
+        raw_data = msg.data
+        if not raw_data or len(raw_data) < 14:
+            return
 
-        # ── 3. 路由到消息队列 ──
-        if msg_type == TransparentProxy.TYPE_EAST:
-            # 东向：写入 Ring Buffer → Dispatcher 线程异步消费
-            ok = self.ring_buffer.push(msg) 
+        # ── 2. EtherType 直接分向（无 metadata 依赖，不会丢失） ──
+        ethertype = struct.unpack("!H", raw_data[12:14])[0]
+
+        # ── 3. 提取公共元信息 ──
+        try:
+            dpid = datapath.id
+        except Exception:
+            dpid = 0
+        try:
+            in_port = msg.match.get('in_port', 0) if msg.match else 0
+        except Exception:
+            in_port = 0
+
+        if ethertype == self.ETHERTYPE_LLDP:
+            # ── 东向：LLDP → Ring Buffer → Dispatcher → Workers → topo_east + perf_east ──
+            ok = self.ring_buffer.push(msg)
             if not ok:
-                self.logger.debug(
-                    f"[EAST] Ring Buffer full, oldest dropped | "
-                    f"dpid={datapath.id:016x}"
-                )
+                self.logger.debug("[LLDP] Ring Buffer full, dropped")
+            return
+
+        # ── 西向：ARP/IP → 主控直推 → arp_queue → ArpHandler ──
+        if ethertype == self.ETHERTYPE_ARP:
+            sm_type = StructuredMessage.TYPE_ARP
+        elif ethertype in (self.ETHERTYPE_IPV4, self.ETHERTYPE_IPV6):
+            sm_type = StructuredMessage.TYPE_IP
         else:
-            # 西向快通道：主控直接构造 StructuredMessage 送入 ArpHandler
-            # 不经过 Dispatcher/Worker 流水线（架构修正）
-            raw_data = msg.data
-            if raw_data and len(raw_data) >= 14:
-                ethertype = struct.unpack("!H", raw_data[12:14])[0]
+            sm_type = StructuredMessage.TYPE_OTHER
 
-                # Bug 6 修复：LLDP 帧 (0x88CC) metadata 不跨网络传播，
-                # 邻居交换机收到的 LLDP PacketIn 无 metadata 标记会被误判为西向。
-                # 必须按 ethertype 重定向到东向 RingBuffer → Worker → topo_east_queue。
-                if ethertype == 0x88CC:
-                    ok = self.ring_buffer.push(msg)
-                    if not ok:
-                        self.logger.debug("[LLDP-REROUTE] Ring Buffer full, LLDP dropped")
-                    return
+        structured = StructuredMessage(
+            msg_type=sm_type,
+            dpid=dpid,
+            in_port=in_port,
+            data=raw_data,
+        )
 
-                if ethertype == 0x0806:
-                    sm_type = StructuredMessage.TYPE_ARP
-                elif ethertype in (0x0800, 0x86DD):
-                    sm_type = StructuredMessage.TYPE_IP
-                else:
-                    sm_type = StructuredMessage.TYPE_OTHER
-
-                try:
-                    dpid = msg.datapath.id
-                except Exception:
-                    dpid = 0
-                try:
-                    in_port = msg.match.get('in_port', 0) if msg.match else 0
-                except Exception:
-                    in_port = 0
-
-                structured = StructuredMessage(
-                    msg_type=sm_type,
-                    dpid=dpid,
-                    in_port=in_port,
-                    data=raw_data,
-                )
-
-                # 推入 ArpHandler 专用队列（首包触发路由查找 + 流表下发）
-                try:
-                    self.arp_queue.put_nowait(structured)
-                except queue.Full:
-                    pass
-
-                # IP 包同时推入性能检测队列（PerformanceMonitor ICMP 匹配）
-                if sm_type == StructuredMessage.TYPE_IP:
-                    for q in self.get_perf_east_queues():
-                        try:
-                            q.put_nowait(structured)
-                        except queue.Full:
-                            pass
+        try:
+            self.arp_queue.put_nowait(structured)
+        except queue.Full:
+            pass
 
         # ── 4. 定期输出统计（每 1000 包） ──
         total = self.ring_buffer.total_pushed
@@ -319,6 +318,32 @@ class SDNController(app_manager.RyuApp):
         if now - self._last_stats_time >= self._stats_interval:
             self._log_comprehensive_stats()
             self._last_stats_time = now
+
+    @set_ev_cls(ofp_event.EventOFPStatsReply, MAIN_DISPATCHER)  # type: ignore[attr-defined]
+    def stats_reply_handler(self, ev):
+        """STATS_REPLY 事件处理器：将端口统计转发到 PerformanceMonitor"""
+        self.perf_monitor.handle_stats_reply(ev)
+
+    def _stats_request_loop(self):
+        """
+        定期排空 PerformanceMonitor 的 STATS_REQUEST 待发送队列，
+        在主控线程中实际发送 OpenFlow STATS_REQUEST 消息。
+        """
+        while True:
+            hub.sleep(0.1)  # type: ignore[arg-type]
+            try:
+                items = self.perf_monitor.drain_pending_requests()
+                for dpid, port_no, link_id, _ts in items:
+                    dp = self.dp_registry.get(dpid)
+                    if dp is None:
+                        continue
+                    parser = dp.ofproto_parser
+                    ofproto = dp.ofproto
+                    # 构造端口统计请求
+                    req = parser.OFPPortStatsRequest(dp, 0, port_no)
+                    dp.send_msg(req)
+            except Exception:
+                self.logger.exception("[STATS_REQUEST] Error in drain loop")
 
     def _log_stats(self):
         """输出消息队列统计"""
@@ -370,7 +395,8 @@ class SDNController(app_manager.RyuApp):
 
         self.logger.info(
             f"📊 [Phase 3] PerfMonitor: consumed={perf_stats['total_consumed']}, "
-            f"ICMP matched={perf_stats['total_icmp_matched']}, "
+            f"LLDP matched={perf_stats['total_lldp_matched']}, "
+            f"STATS replies={perf_stats['total_stats_replies']}, "
             f"active_links={perf_stats['active_links']}, "
             f"levels={perf_stats['detector']['level_distribution']}"
         )

@@ -1,28 +1,28 @@
 """
-性能监控主循环
+设计文档 §3.5 性能监控主循环（融合方案）
 
 职责：
-  1. 消费东向队列（east_queue）中的消息
-  2. 对数据包进行字节累积（→ 吞吐量计算）
-  3. 识别 ICMP Echo Request/Reply 对（→ 时延/抖动估算）
+  1. 消费东向队列（perf_east_queue）中的 LLDP 消息 → 提取时间戳 → 时延/丢包率
+  2. 经由 AdaptiveScheduler 排队 STATS_REQUEST（由 app.py 主线程实际发送）
+  3. 接收 STATS_REPLY 端口字节计数器 → 吞吐量
   4. 调用 MetricsCalculator + EWMADetector
-  5. 定期输出检测结果
+  5. 异步写入 MySQL perf_history
 
-Phase 2 简化策略：
-  - 被动采集：从 east_queue 消费 Worker 处理后的消息
-  - 时延估算：通过 ICMP Echo 对计算 RTT
-  - 不主动发送 STATS_REQUEST（Phase 3+ 配合 STALKER 实现）
-
-未来方向（Phase 3+）：
-  - 主动 STATS_REQUEST 轮询
-  - 与 STALKER 架构集成（监听 perf:stream: 变更）
-  - 写入 Redis Stream + Hash
+数据流：
+  - 时延/丢包率: LLDPCollector (record_lldp_send) → SwitchA → SwitchB
+                 → PacketIn → RingBuffer → Dispatcher → Worker
+                 → perf_east_queue → PerformanceMonitor (record_lldp_recv)
+  - 吞吐量:     PerformanceMonitor → AdaptiveScheduler → _pending_requests queue
+                 → app.py (hub.spawn 主线程) → STATS_REQUEST → Switch
+                 → STATS_REPLY → app.py stats_reply_handler → monitor.handle_stats_reply
+                 → record_port_stats → set_link_throughput
+  - 拥堵检测:   EWMADetector.evaluate() → congestion_level (0-3)
+  - 持久化:     MySQLWriterThread.enqueue() (异步 fire-and-forget)
 """
 
-import struct
-import time
 import threading
-from typing import Dict, List, Optional, Set, Tuple
+import time
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .metrics import MetricsCalculator, LinkMetrics
 from .detector import EWMADetector
@@ -31,37 +31,41 @@ from .sampler import AdaptiveScheduler
 
 class PerformanceMonitor:
     """
-    性能监控器
+    设计文档 §3.5 性能监控器（融合方案）
 
-    独立线程运行，消费 east_queue，持续计算链路性能指标。
+    独立线程运行：
+      - 消费 perf_east_queue（LLDP 分组消息）
+      - 排队 STATS_REQUEST（由 app.py 主线程实际发送）
+      - 定时计算四指标 + 拥堵等级
+
+    STATS_REQUEST 发收分离模式：
+      monitor 线程 → _pending_requests (Queue) → app.py hub.spawn → send_msg
+      switch → STATS_REPLY → app.py stats_reply_handler → monitor.handle_stats_reply
 
     用法：
-      monitor = PerformanceMonitor(east_queues)
+      monitor = PerformanceMonitor(perf_east_queues, lldp_collector, dp_registry, logger, mysql_writer)
       monitor.start()
-      # ... 读取 monitor.poll_results() 或使用回调
+      # app.py 中:
+      #   hub.spawn(_stats_request_loop) — 定期排空 _pending_requests
+      #   set_ev_cls(EventOFPStatsReply) → monitor.handle_stats_reply(ev)
     """
-
-    # ICMP 协议号
-    IP_PROTO_ICMP = 1
-
-    # ICMP 类型
-    ICMP_ECHO_REQUEST = 8
-    ICMP_ECHO_REPLY = 0
-
-    # ICMP Echo 超时时间（秒）— 超过此时间未收到 Reply 则丢弃 Request
-    ICMP_TIMEOUT = 5.0
 
     # 结果轮询间隔
     RESULT_POLL_INTERVAL = 1.0
 
-    def __init__(self, east_queues: List, logger=None, mysql_writer=None):
+    def __init__(self, east_queues: List, lldp_collector=None,
+                 dp_registry=None, logger=None, mysql_writer=None):
         """
         Args:
-            east_queues: Worker 的 east_queue 列表
+            east_queues: Worker 的 perf_east_queue 列表
+            lldp_collector: LLDPCollector 实例（用于获取 datapath 引用以发送 STATS_REQUEST）
+            dp_registry: DatapathRegistry 实例（用于获取 datapath 引用以发送 STATS_REQUEST）
             logger: 日志器
-            mysql_writer: MySQLWriterThread 实例（可选，用于异步写入 perf_history）
+            mysql_writer: MySQLWriterThread 实例
         """
         self.east_queues = east_queues
+        self.lldp_collector = lldp_collector
+        self.dp_registry = dp_registry
         self.logger = logger
         self._mysql_writer = mysql_writer
 
@@ -70,13 +74,17 @@ class PerformanceMonitor:
         self.detector = EWMADetector(alpha=0.2)
         self.scheduler = AdaptiveScheduler()
 
-        # ICMP Echo 跟踪
-        # {(src_dpid, icmp_id, icmp_seq): send_timestamp}
-        self._pending_echo: Dict[Tuple[int, int, int], float] = {}
-        self._echo_lock = threading.Lock()
-
         # 已知链路集合
         self._known_links: Set[Tuple] = set()
+
+        # STATS_REQUEST 待发送队列
+        # [(dpid, port_no, link_id, timestamp)]
+        self._pending_requests: List[Tuple[int, int, Tuple, float]] = []
+        self._req_lock = threading.Lock()
+
+        # LLDP 封包顺序跟踪：记录 switch_send 顺序以使 link_id 映射一致
+        # {dpid: last_sent_port}  — 用于在 perf_east_queue 消费时推断 dst
+        self._last_lldp_sent: Dict[int, int] = {}
 
         # 最新检测结果
         self._latest_metrics: Dict[Tuple, LinkMetrics] = {}
@@ -90,17 +98,26 @@ class PerformanceMonitor:
 
         # 统计
         self._total_consumed = 0
-        self._total_icmp_matched = 0
+        self._total_lldp_matched = 0
+        self._total_stats_replies = 0
+        self._total_stats_reply_ports = 0
+
+    # ──────────────────────────────────────────────
+    # 生命周期
+    # ──────────────────────────────────────────────
 
     def start(self):
         """启动监控线程"""
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="PerfMonitor")
+        self._thread = threading.Thread(target=self._run_loop, daemon=True,
+                                        name="PerfMonitor")
         self._thread.start()
         if self.logger:
-            self.logger.info("[PerfMonitor] Started with %d east queues", len(self.east_queues))
+            self.logger.info("[PerfMonitor] Started with %d east queues "
+                             "(LLDP delay/loss + STATS_REQUEST throughput)",
+                             len(self.east_queues))
 
     def stop(self):
         """停止监控线程"""
@@ -109,10 +126,13 @@ class PerformanceMonitor:
             self._thread.join(timeout=2.0)
             self._thread = None
 
+    # ──────────────────────────────────────────────
+    # 链路注册
+    # ──────────────────────────────────────────────
+
     def register_link(self, link_id: Tuple[int, int, int, int]):
         """注册链路（由拓扑发现模块调用）"""
         self._known_links.add(link_id)
-        # 标准化的双向 key
         rev_key = (link_id[2], link_id[3], link_id[0], link_id[1])
         self._known_links.add(rev_key)
 
@@ -125,27 +145,28 @@ class PerformanceMonitor:
         self.detector.reset_link(link_id)
         self.scheduler.remove_link(link_id)
 
+    # ──────────────────────────────────────────────
+    # 主循环
+    # ──────────────────────────────────────────────
+
     def _run_loop(self):
-        """主循环：消费队列 → 累积字节 → 定时计算指标"""
+        """主循环：消费 LLDP → 排队 STATS_REQUEST → 定时计算指标"""
         last_calculation = time.time()
-        last_timeout_clean = time.time()
 
         while self._running:
             try:
-                # 1. 消费东向队列
+                # 1. 消费 perf_east_queue（LLDP 消息 → 时延/丢包率）
                 consumed = self._consume_queues()
                 self._total_consumed += consumed
 
-                # 2. 定期计算指标
+                # 2. 排队 STATS_REQUEST（仅对已知、活跃的链路）
+                self._schedule_stats_requests()
+
+                # 3. 定期计算指标 + 拥堵等级
                 now = time.time()
                 if now - last_calculation >= self.scheduler.BASE_INTERVAL:
                     self._calculate_and_update()
                     last_calculation = now
-
-                # 3. 定期清理超时 ICMP Echo
-                if now - last_timeout_clean >= self.ICMP_TIMEOUT:
-                    self._clean_stale_echo(now)
-                    last_timeout_clean = now
 
             except Exception:
                 if self.logger:
@@ -153,8 +174,12 @@ class PerformanceMonitor:
 
             time.sleep(0.1)  # 100ms 消费间隔
 
+    # ──────────────────────────────────────────────
+    # LLDP 消费（perf_east_queue）
+    # ──────────────────────────────────────────────
+
     def _consume_queues(self) -> int:
-        """从所有东向队列中消费消息，返回消费数量"""
+        """从所有 perf_east_queue 中消费 LLDP 消息"""
         consumed = 0
         for q in self.east_queues:
             while True:
@@ -163,94 +188,161 @@ class PerformanceMonitor:
                 except Exception:
                     break
 
-                self._process_message(msg)
+                self._process_lldp_message(msg)
                 consumed += 1
         return consumed
 
-    def _process_message(self, structured_msg) -> None:
-        """处理单条结构化消息"""
+    def _process_lldp_message(self, structured_msg) -> None:
+        """
+        处理 perf_east_queue 中的 LLDP 分组消息
+
+        从 LLDP 帧中解析 src_dpid / src_port，结合 PacketIn 的 dpid / in_port
+        获得完整 link_id (src_dpid, src_port, dst_dpid, dst_port)。
+
+        调用 MetricsCalculator.record_lldp_recv() 记录时延和丢包率接收计数。
+        """
         from modules.message_queue.worker import StructuredMessage
+        from modules.topology.lldp_utils import parse_lldp_frame, LLDP_ETHERTYPE
+        import struct
 
         raw_data = structured_msg.data
         if not raw_data or len(raw_data) < 14:
             return
 
-        dpid = structured_msg.dpid
-        in_port = structured_msg.in_port
-
-        # 1. 字节累积（用于吞吐量计算）
-        # link_key：用 (dpid, in_port, 0, 0) 作为单向入口标识
-        link_key = (dpid, in_port, 0, 0)
-        self.calculator.record_packet(link_key, len(raw_data))
-
-        # 2. ICMP Echo 匹配（用于时延/抖动估算）
-        self._try_match_icmp(raw_data, dpid, in_port)
-
-    def _try_match_icmp(self, raw_data: bytes, dpid: int, in_port: int) -> None:
-        """
-        尝试匹配 ICMP Echo Request/Reply 对
-
-        解析 IPv4 + ICMP 头，提取 (icmp_id, icmp_seq) 作为匹配 key。
-        """
-        # 解析以太网帧头
+        # 校验 ethertype
         ethertype = struct.unpack("!H", raw_data[12:14])[0]
-        if ethertype != 0x0800:
+        if ethertype != LLDP_ETHERTYPE:
             return
 
-        # 解析 IP 头
-        if len(raw_data) < 34:
-            return
-        ip_header_len = (raw_data[14] & 0x0F) * 4
-        ip_proto = raw_data[23]
+        dst_dpid = structured_msg.dpid
+        dst_port = structured_msg.in_port
 
-        if ip_proto != self.IP_PROTO_ICMP:
-            return
-
-        icmp_start = 14 + ip_header_len
-        if len(raw_data) < icmp_start + 8:
+        # 解析 LLDP 帧获取 src 信息
+        lldp_pkt = parse_lldp_frame(raw_data)
+        if lldp_pkt is None:
             return
 
-        icmp_type = raw_data[icmp_start]
-        icmp_code = raw_data[icmp_start + 1]
-        icmp_id = struct.unpack("!H", raw_data[icmp_start + 4:icmp_start + 6])[0]
-        icmp_seq = struct.unpack("!H", raw_data[icmp_start + 6:icmp_start + 8])[0]
+        src_dpid = lldp_pkt.src_dpid
+        src_port = lldp_pkt.src_port
 
+        if src_dpid is None or src_port is None:
+            return
+
+        link_id = (src_dpid, src_port, dst_dpid, dst_port)
+
+        # 记录 LLDP 接收 → 时延
+        delay_ms = self.calculator.record_lldp_recv(
+            src_dpid, src_port, dst_dpid, dst_port)
+
+        if delay_ms is not None:
+            self._total_lldp_matched += 1
+
+    # ──────────────────────────────────────────────
+    # STATS_REQUEST 调度（排队 → app.py 主线程发送）
+    # ──────────────────────────────────────────────
+
+    def _schedule_stats_requests(self):
+        """
+        遍历已知链路，按 AdaptiveScheduler 决定是否采样。
+
+        将待发送的 (dpid, port_no, link_id) 写入 _pending_requests，
+        由 app.py 的 hub.spawn 定时器排空并实际发送 STATS_REQUEST。
+        """
         now = time.time()
-        echo_key = (dpid, icmp_id, icmp_seq)
 
-        if icmp_type == self.ICMP_ECHO_REQUEST:
-            # 记录发送时间
-            with self._echo_lock:
-                self._pending_echo[echo_key] = now
+        for link_id in list(self._known_links):
+            src_dpid, src_port, dst_dpid, dst_port = link_id
 
-        elif icmp_type == self.ICMP_ECHO_REPLY:
-            # 查找对应的 Request
-            with self._echo_lock:
-                send_time = self._pending_echo.pop(echo_key, None)
+            if not self.scheduler.should_sample(link_id, now):
+                continue
 
-            if send_time is not None:
-                rtt_ms = (now - send_time) * 1000.0
-                # 记录 RTT 到对应链路（简化：使用单向入口）
-                link_key = (dpid, in_port, 0, 0)
-                self.calculator.record_rtt(link_key, rtt_ms)
-                self._total_icmp_matched += 1
+            # 加入待发送队列
+            with self._req_lock:
+                self._pending_requests.append(
+                    (src_dpid, src_port, link_id, now))
 
-    def _clean_stale_echo(self, now: float):
-        """清理超时的 ICMP Echo Request 记录"""
-        with self._echo_lock:
-            stale = [k for k, t in self._pending_echo.items()
-                     if now - t > self.ICMP_TIMEOUT]
-            for k in stale:
-                del self._pending_echo[k]
+            self.scheduler.record_sample(link_id, now)
+
+    def drain_pending_requests(self) -> list:
+        """
+        取出并清空 STATS_REQUEST 待发送队列
+
+        由 app.py 在 hub.spawn 定时器中调用。
+        返回：[(dpid, port_no, link_id), ...]
+        """
+        with self._req_lock:
+            items = self._pending_requests[:]
+            self._pending_requests.clear()
+        return items
+
+    # ──────────────────────────────────────────────
+    # STATS_REPLY 处理（由 app.py 主线程调用）
+    # ──────────────────────────────────────────────
+
+    def handle_stats_reply(self, ev):
+        """
+        处理 OFPT_STATS_REPLY 事件（由 app.py 的 RyuApp 事件处理器调用）
+
+        提取每个端口的 tx_bytes / rx_bytes → record_port_stats(),
+        然后根据已知链路映射将端口吞吐量写入 link_throughput。
+
+        Args:
+            ev: EventOFPStatsReply 事件对象
+        """
+        msg = ev.msg
+        datapath = msg.datapath
+        dpid = datapath.id
+        body = msg.body
+
+        self._total_stats_replies += 1
+
+        for stat in body:
+            # OFPPortStats: port_no, rx_packets, tx_packets, rx_bytes, tx_bytes, ...
+            port_no = stat.port_no
+            tx_bytes = stat.tx_bytes
+            rx_bytes = stat.rx_bytes
+
+            # 记录端口统计 → 返回吞吐量
+            port_throughput = self.calculator.record_port_stats(
+                dpid, port_no, tx_bytes, rx_bytes)
+
+            self._total_stats_reply_ports += 1
+
+            if port_throughput is None:
+                continue
+
+            # ── 映射端口吞吐量 → 链路吞吐量 ──
+            # 查找所有以 (dpid, port_no) 为 src 的已知链路
+            for link_id in list(self._known_links):
+                if link_id[0] == dpid and link_id[1] == port_no:
+                    self.calculator.set_link_throughput(link_id, port_throughput)
+
+                    # 更新调度器利用率
+                    utilization = min(port_throughput / 1e9, 1.0)
+                    self.scheduler.next_interval(link_id, utilization)
+
+    # ──────────────────────────────────────────────
+    # LLDP 发送记录（由 collector 调用）
+    # ──────────────────────────────────────────────
+
+    def on_lldp_sent(self, dpid: int, port_no: int):
+        """
+        LLDP 发送回调（由 LLDPCollector 在每次 send 时调用）
+
+        记录发送时间戳到 MetricsCalculator，为后续时延匹配做准备。
+        """
+        self.calculator.record_lldp_send(dpid, port_no)
+
+    # ──────────────────────────────────────────────
+    # 定期计算
+    # ──────────────────────────────────────────────
 
     def _calculate_and_update(self):
-        """遍历所有活跃链路，计算指标并评估拥堵等级"""
-        # 获取所有活跃的 link_key
-        active_keys = set(self.calculator._link_bytes.keys())
+        """遍历所有活跃链路，计算四指标 + 拥堵等级 + 异步写入 MySQL"""
+        active_link_ids = self.calculator.get_active_link_ids()
 
-        for link_key in active_keys:
-            # 计算四指标
-            metrics = self.calculator.calculate(link_key)
+        for link_id in active_link_ids:
+            metrics = self.calculator.calculate(link_id)
 
             # 跳过全零指标（无有效数据）
             if metrics.throughput == 0 and metrics.delay == 0:
@@ -259,25 +351,22 @@ class PerformanceMonitor:
             # 评估拥堵等级
             level = self.detector.evaluate(metrics)
 
-            # 更新调度器
-            utilization = min(metrics.throughput / 1e9, 1.0)  # 标准化到 0-1（以 1Gbps 为基准）
-            self.scheduler.next_interval(link_key, utilization)
-
             # 存储最新结果
             with self._results_lock:
-                self._latest_metrics[link_key] = metrics
-                self._latest_levels[link_key] = level
+                self._latest_metrics[link_id] = metrics
+                self._latest_levels[link_id] = level
                 self._results_available.notify_all()
 
-            # ── 异步写入 MySQL（fire-and-forget，不阻塞） ──
-            self._enqueue_perf(link_key, metrics, level)
+            # ── 异步写入 MySQL（fire-and-forget） ──
+            self._enqueue_perf(link_id, metrics, level)
 
     def _enqueue_perf(self, link_key: Tuple, metrics: LinkMetrics, level: int):
-        """Fire-and-forget：将性能数据异步写入 MySQL perf_history 表"""
+        """Fire-and-forget：将链路性能数据异步写入 MySQL perf_history 表"""
         if self._mysql_writer is None:
             return
-        # link_id: 格式化为 "{dpid}:{port}"（单向入口标识）
-        link_id_str = f"{link_key[0]:016x}:{link_key[1]}"
+        # link_id: 格式化为 "{src_dpid:x}:{src_port}→{dst_dpid:x}:{dst_port}"
+        link_id_str = (f"{link_key[0]:x}:{link_key[1]}"
+                       f"→{link_key[2]:x}:{link_key[3]}")
         row = {
             'link_id': link_id_str,
             'throughput': metrics.throughput,
@@ -288,13 +377,12 @@ class PerformanceMonitor:
         }
         self._mysql_writer.enqueue(row)
 
-    def poll_results(self, timeout: Optional[float] = None) -> Tuple[Dict, Dict]:
-        """
-        轮询最新检测结果（阻塞）
+    # ──────────────────────────────────────────────
+    # 结果查询
+    # ──────────────────────────────────────────────
 
-        Returns:
-            (metrics_dict, levels_dict)
-        """
+    def poll_results(self, timeout: Optional[float] = None) -> Tuple[Dict, Dict]:
+        """轮询最新检测结果（阻塞）"""
         with self._results_lock:
             if not self._latest_metrics and timeout is not None:
                 self._results_available.wait(timeout)
@@ -315,8 +403,11 @@ class PerformanceMonitor:
     def stats(self) -> dict:
         return {
             "total_consumed": self._total_consumed,
-            "total_icmp_matched": self._total_icmp_matched,
+            "total_lldp_matched": self._total_lldp_matched,
+            "total_stats_replies": self._total_stats_replies,
+            "total_stats_reply_ports": self._total_stats_reply_ports,
             "active_links": len(self._latest_metrics),
+            "known_links": len(self._known_links),
             "calculator": self.calculator.stats(),
             "detector": self.detector.stats(),
             "sampler": self.scheduler.stats(),

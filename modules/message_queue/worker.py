@@ -306,16 +306,17 @@ class Worker:
 
         # 5. 按类型路由到输出队列
         if msg_type == StructuredMessage.TYPE_LLDP:
-            # LLDP → 拓扑发现（TopologyProcessor 消费）
+            # LLDP → 拓扑发现 + 性能检测（fan-out 双写）
+            #   - topo_east_queue: TopologyProcessor 消费（链路绘制）
+            #   - perf_east_queue: PerformanceMonitor 消费（时间戳提取 → 时延/丢包率）
             self._put_to_queue(self.topo_east_queue, structured)
-            self._total_east += 1
-        elif msg_type == StructuredMessage.TYPE_IP:
-            # IP 包 → 性能检测 + 西向路由（fan-out 双写）
-            #   - perf_east_queue: PerformanceMonitor 消费（ICMP RTT 等）
-            #   - west_queue: ArpHandler 消费（首包触发路由查找 → 流表下发）
             self._put_to_queue(self.perf_east_queue, structured)
-            self._put_to_queue(self.west_queue, structured)
+            self._total_east += 1
             self._total_perf += 1
+        elif msg_type == StructuredMessage.TYPE_IP:
+            # IP → 仅西向队列（ArpHandler 消费：首包触发路由查找 → 流表下发）
+            # 性能检测不再消费 IP 包（改用 LLDP 时延 + STATS_REQUEST 吞吐量）
+            self._put_to_queue(self.west_queue, structured)
             self._total_west += 1
         else:
             # ARP / OTHER → 西向队列（ArpHandler 消费：主机学习 + 泛洪/回复）

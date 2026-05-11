@@ -62,6 +62,10 @@ class LLDPCollector:
         # 下行队列：主控线程消费此队列并实际 send_msg
         self.downlink_queue: List = []  # list of (datapath, ofp_msg)
 
+        # LLDP 发送回调（注入 PerformanceMonitor.on_lldp_sent）
+        # 每次构造 LLDP 帧时调用，传入 (dpid, port_no) 供性能检测记录时间戳
+        self.on_lldp_sent_callback = None
+
         # 统计
         self._total_lldp_sent = 0
         self._running = False
@@ -150,9 +154,8 @@ class LLDPCollector:
             port_id_str = str(port_no)
             lldp_frame = build_lldp_frame(chassis_mac, port_id_str)
 
-            # 构造 PacketOut（metadata=1 标记东向，供主控 TransparentProxy 识别）
+            # 构造 PacketOut（EtherType 分向替代 metadata，无需打标签）
             actions = [
-                parser.OFPActionSetField(metadata=1),
                 parser.OFPActionOutput(port_no),
             ]
             out = parser.OFPPacketOut(
@@ -167,6 +170,10 @@ class LLDPCollector:
             with self._lock:
                 self.downlink_queue.append((dp, out))
                 self._total_lldp_sent += 1
+
+            # ── 通知性能检测模块：LLDP 已发送 ──
+            if self.on_lldp_sent_callback:
+                self.on_lldp_sent_callback(sw.dpid, port_no)
 
     def drain_downlink(self) -> List:
         """

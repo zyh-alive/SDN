@@ -1,22 +1,17 @@
 """
-透传路由模块 — 消息方向分类（metadata 标签机制）
+透传路由模块 — 已废弃
 
-职责：
-  根据 OpenFlow metadata 字段判断消息属于东向采集通道还是西向首包通道。
-  分类仅用于选择传输通道（Ring Buffer vs 直通队列），
-  业务级二次分类（LLDP/IP）由 Worker 根据 ethertype 完成。
+原功能：根据 OpenFlow metadata 字段判断消息方向（东向/西向）。
+现已由 EtherType 直接分向替代（见 controllers/app.py packet_in_handler）。
 
-分类规则：
-  1. metadata == TYPE_EAST (1) → 东向 — 采集数据（LLDP 探测 / IP 性能采集），走 Ring Buffer 削峰
-  2. metadata != TYPE_EAST (默认 0) → 西向 — 首包数据（ARP/IP 未标记包），直入 arphandler
-
-metadata 来源：
-  LLDPCollector 下发 PacketOut 时通过 OFPActionSetField(metadata=1) 打标签。
-  交换机收到该 LLDP 帧后上送 PacketIn 时携带 metadata=1。
+保留原因：TYPE_EAST/TYPE_WEST 常量可能被外部旧代码引用。
+迁移计划：所有引用方应改为直接使用 EtherType 常量（0x88CC/0x0806/0x0800/0x86DD）。
 """
 
 
 class TransparentProxy:
+    """已废弃的 metadata 分类器 — 保留仅用于向后兼容"""
+
     TYPE_EAST = 1
     TYPE_WEST = 2
 
@@ -26,19 +21,20 @@ class TransparentProxy:
 
     def classify_by_metadata(self, msg) -> int:
         """
-        根据 metadata 字段判断消息方向（传输通道选择）
+        [已废弃] 根据 metadata 字段判断消息方向
 
-        东向 (TYPE_EAST=1): metadata==1 → LLDP 探测回升包 / IP 采集包 → Ring Buffer
-        西向 (TYPE_WEST=2): metadata!=1 → 普通 ARP/IP 首包 → 直通 arphandler
+        现已由 controllers/app.py 中的 EtherType 直接分向替代。
+        调用此方法将在日志中输出废弃警告。
 
         Args:
             msg: Ryu PacketIn 消息对象 (ev.msg)
 
         Returns:
-            TYPE_EAST (1) 或 TYPE_WEST (2)
+            TYPE_WEST (2) — 始终返回西向，不执行任何有效分类
         """
-        metadata = msg.match.get('metadata', 0) if msg.match else 0
-        #get('metadata', 0)这里面的0为默认值，走西向通道
-        if metadata == self.TYPE_EAST:
-            return self.TYPE_EAST
+        self.logger.warning(
+            "[TransparentProxy] classify_by_metadata() is DEPRECATED. "
+            "Packet classification now uses EtherType directly in packet_in_handler. "
+            "Returning TYPE_WEST as fallback."
+        )
         return self.TYPE_WEST
