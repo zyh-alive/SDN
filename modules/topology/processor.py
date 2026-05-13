@@ -45,7 +45,6 @@ from .validator import LLDPValidator
 if TYPE_CHECKING:
     from storage.redis_client import RedisClient
     from storage.mysql_client import MySQLWriterThread
-    from modules.stalker.stalker_manager import StalkerManager
 
 
 # ── 链路变更事件 ───────────────────────────────────
@@ -314,6 +313,15 @@ class TopologyProcessor:
       # ...从 east_queue 消费消息...
       msg = east_queue.get()
       event = processor.process_structured_message(msg)
+
+    Redis Stream 通知链（对齐设计文档 §Phase 3）：
+      processor._write_to_redis()
+        → SET topology:graph:current  (JSON 快照)
+        → INCR topology:graph:version (版本号)
+        → XADD topology:events {...}  (StalkerManager XREADGROUP 消费)
+      StalkerManager._run_loop()
+        → XREADGROUP topology:events
+        → RouteManager.on_events()
     """
 
     # LLDP 超时时间（秒）— 连续 3 次未收到 = 3 × LLDP_INTERVAL
@@ -322,13 +330,15 @@ class TopologyProcessor:
     # 超时扫描间隔（对齐 LLDP 下发周期）
     TIMEOUT_SCAN_INTERVAL = 2.0
 
+    # Redis Stream 名称
+    STREAM_TOPOLOGY = 'topology:events'
+
     def __init__(self, logger: Any = None,
                  redis_client: "Optional[RedisClient]" = None,
                  mysql_writer: "Optional[MySQLWriterThread]" = None):
         self.logger: Any = logger
         self._redis: "Optional[RedisClient]" = redis_client
         self._mysql_writer: "Optional[MySQLWriterThread]" = mysql_writer
-        self._stalker_manager: "Optional[StalkerManager]" = None
         self.graph = TopologyGraph()
         self.validator = LLDPValidator()
         self.debounce = DebounceWindow(base_window=2.0, max_window=5.0)
@@ -364,10 +374,6 @@ class TopologyProcessor:
         """Phase 3: 延迟注入 Redis 客户端"""
         self._redis = redis_client
 
-    def set_stalker_manager(self, stalker_manager: "StalkerManager") -> None:
-        """Phase 3: 注入盯梢者管理器（进程内直接通知）"""
-        self._stalker_manager = stalker_manager
-
     def set_mysql_writer(self, mysql_writer: "MySQLWriterThread") -> None:
         """Phase 3: 注入 MySQL 异步写入器（fire-and-forget）"""
         self._mysql_writer = mysql_writer
@@ -402,27 +408,35 @@ class TopologyProcessor:
 
     def _write_to_redis(self, events: List[LinkEvent]) -> None:
         """
-        每次 flush 时写入 Redis：
+        每次 flush 时写入 Redis（对齐设计文档 §Phase 3）：
           SET  topology:graph:current  — JSON 全量快照
           INCR topology:graph:version  — 单调递增版本号
-        并进程内直接通知 StalkerManager（零网络开销）。
+          XADD topology:events {...}   — 事件通知（StalkerManager XREADGROUP 消费）
+
+        Processor 完全不知道下游消费者是谁，通过 Redis Stream 唯一交互中心解耦。
         """
         if not self._redis:
             return
 
         client = self._redis.client
+
+        # 1. 管道写入快照 + 版本号
         pipe = client.pipeline()  # type: ignore[reportUnknownMemberType]
-        pipe.set('topology:graph:current', json.dumps(self.graph.to_dict())) #写入快照
-        pipe.incr('topology:graph:version') #版本号自增，供盯梢者检测变更使用
-        pipe.execute() #执行 Redis 命令
+        pipe.set('topology:graph:current', json.dumps(self.graph.to_dict()))
+        pipe.incr('topology:graph:version')
+        pipe.execute()
 
-        # 进程内唤醒盯梢者（零网络、零轮询）
-        self._notify_stalkers(events)
-
-    def _notify_stalkers(self, events: List[LinkEvent]) -> None:
-        """进程内直接调用 StalkerManager（零 Redis 中间层）"""
-        if self._stalker_manager is not None:
-            self._stalker_manager.notify(events)
+        # 2. 逐事件 XADD topology:events
+        #    每条事件独立写入，供 StalkerManager XREADGROUP 逐条消费
+        batch_events = {'events': json.dumps([e.to_dict() for e in events])}
+        try:
+            client.xadd(self.STREAM_TOPOLOGY, batch_events, maxlen=10000)  # type: ignore[reportArgumentType]
+        except Exception:
+            if self.logger:
+                self.logger.exception(
+                    "[TopologyProcessor] XADD topology:events failed (%d events)",
+                    len(events),
+                )
 
     # ── Phase 3: MySQL 异步写入（fire-and-forget） ──
 

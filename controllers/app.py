@@ -126,10 +126,12 @@ class SDNController(app_manager.RyuApp):
         self.logger.info("🗄️  Phase 3: MySQL connected (async writers: topology + perf)")
 
         # ── Phase 3: 初始化 StalkerManager + RouteManager ──
-        self.stalker_manager = StalkerManager(logger=self.logger)
+        # StalkerManager 通过 Redis Stream 消费 topology:events（对齐设计文档 §Phase 3）
+        self.stalker_manager = StalkerManager(redis_client=self.redis_client, logger=self.logger)
         self.route_manager = RouteManager(logger=self.logger)
-        self.stalker_manager.register(self.route_manager, wake_order=0) #两个参数：被注册的盯梢者实例和唤醒顺序，数字越小越先被调用，这里 RouteManager 的唤醒顺序设置为 0，表示它将是第一个被通知的盯梢者
-        self.logger.info("📡 Phase 3: StalkerManager + RouteManager registered")
+        self.stalker_manager.register(self.route_manager, wake_order=0)
+        self.stalker_manager.start()
+        self.logger.info("📡 Phase 3: StalkerManager (Redis Stream XREADGROUP) + RouteManager registered")
 
         # ── Phase 4: 流表下发基础设施 ──
         self.dp_registry = DatapathRegistry()
@@ -141,8 +143,10 @@ class SDNController(app_manager.RyuApp):
         self.topology_processor = TopologyProcessor(logger=self.logger,
                                                      redis_client=self.redis_client,
                                                      mysql_writer=self.mysql_writer)
-        # 进程内通知：processor → StalkerManager → RouteManager（零 Redis 中间层）
-        self.topology_processor.set_stalker_manager(self.stalker_manager)
+        # 通知链路（对齐设计文档 §Phase 3）：
+        #   processor._write_to_redis() → XADD topology:events
+        #   → StalkerManager XREADGROUP → RouteManager.on_events()
+        # Processor 不再持有 StalkerManager 引用（完全通过 Redis 解耦）
 
         # 启动拓扑处理器（防抖窗口 + 超时扫描）
         self.topology_processor.start()

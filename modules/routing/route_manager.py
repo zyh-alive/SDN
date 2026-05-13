@@ -9,12 +9,13 @@ RouteManager — 路由管理协调器（Stalker 盯梢者）
   5. Phase 4.5 将集成流表下发（FlowMod deploy）
 
 数据流：
-  processor._apply_events()
-    → stalker_manager.notify(events)
-      → RouteManager.on_events(events)
-        → topology_graph.get_full()
-        → perf_monitor.get_latest_metrics() / get_latest_levels()
-        → RouteCalculator.compute(src, dst, profile=...)
+  processor._write_to_redis()
+    → XADD topology:events {...}
+      → StalkerManager XREADGROUP
+        → RouteManager.on_events(events)
+          → topology_graph.get_full()
+          → perf_monitor.get_latest_metrics() / get_latest_levels()
+          → RouteCalculator.compute(src, dst, profile=...)
 
 遵循"一个功能一个文件"原则 — 本文件仅做协调，不实现具体算法。
 """
@@ -118,15 +119,28 @@ class RouteManager(Stalker):
         """
         接收拓扑变更事件，触发路由重算。
 
-        StalkerManager 通过 notify() 级联调用此方法。
+        StalkerManager 通过 Redis XREADGROUP 唤醒后调用。
+        events: [{'events': [{'type': 'ADD'|'DELETE', 'src_dpid': ..., ...}, ...]}]
         """
         if not self._topology_graph:
             self.logger.warning("[RouteManager] No topology_graph injected, skip recompute")
             return {"error": "no topology graph", "routes": 0}
 
+        # 从 Redis Stream 消息中提取事件计数（用于日志）
+        event_count = 0
+        batch = events[0] if events else {}
+        raw_list = batch.get('events', []) if isinstance(batch, dict) else []
+        if isinstance(raw_list, str):
+            try:
+                import json as _json
+                raw_list = _json.loads(raw_list)
+            except (_json.JSONDecodeError, TypeError):
+                raw_list = []
+        event_count = len(raw_list) if isinstance(raw_list, list) else len(events)
+
         self.logger.info(
-            f"[RouteManager] Received {len(events)} topology events, "
-            f"recomputing routes..."
+            f"[RouteManager] Received %d topology events (via Redis Stream), "
+            f"recomputing routes...", event_count,
         )
 
         return self.recompute_all()

@@ -305,7 +305,7 @@ class MySQLWriterThread:
         if not batch:
             return
         try:
-            written = self._write_fn(batch)
+            written = self. _write_fn(batch)
             with self._lock:
                 self._total_written += written
                 if written < len(batch):
