@@ -1,12 +1,13 @@
 """
-设计文档 §3.5 性能监控主循环（融合方案）
+设计文档 §3.5 性能监控主循环（融合方案）+ 混合架构进程内回调
 
 职责：
   1. 消费东向队列（perf_east_queue）中的 LLDP 消息 → 提取时间戳 → 时延/丢包率
   2. 经由 AdaptiveScheduler 排队 STATS_REQUEST（由 app.py 主线程实际发送）
   3. 接收 STATS_REPLY 端口字节计数器 → 吞吐量
   4. 调用 MetricsCalculator + EWMADetector
-  5. 异步写入 MySQL perf_history
+  5. 异步写入 MySQL perf_history（fire-and-forget）
+  6. 拥堵等级变化 → 进程内回调 set_on_perf_updated() → RouteManager.recompute_all()
 
 数据流：
   - 时延/丢包率: LLDPCollector (record_lldp_send) → SwitchA → SwitchB
@@ -18,6 +19,11 @@
                  → record_port_stats → set_link_throughput
   - 拥堵检测:   EWMADetector.evaluate() → congestion_level (0-3)
   - 持久化:     MySQLWriterThread.enqueue() (异步 fire-and-forget)
+  - 通知链（混合架构 — 进程内回调）:
+    PerformanceMonitor._calculate_and_update()
+      → 拥堵等级变化检测
+      → _on_perf_updated([{link_id, old_level, new_level, metrics}, ...])
+      → RouteManager.recompute_all()（进程内直接调用，高频率性能数据不经过 Redis）
 """
 
 import threading
@@ -89,6 +95,10 @@ class PerformanceMonitor:
         self._results_lock = threading.Lock()
         self._results_available = threading.Condition(self._results_lock)
 
+        # 进程内回调：拥堵等级变化时触发（混合架构 — 高频性能数据不经过 Redis）
+        self._on_perf_updated: Optional[Callable[[List[Dict[str, Any]]], None]] = None
+        self._previous_levels: Dict[Tuple[int, int, int, int], int] = {}
+
         # 运行状态
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -124,6 +134,23 @@ class PerformanceMonitor:
             self._thread = None
 
     # ──────────────────────────────────────────────
+    # 进程内回调（混合架构）
+    # ──────────────────────────────────────────────
+
+    def set_on_perf_updated(self, callback: Callable[[List[Dict[str, Any]]], None]) -> None:
+        """
+        注册「性能数据/拥堵等级更新」回调（进程内调用，高频）。
+
+        回调签名为 callback(changes: list) -> None，
+        其中 changes = [{'link_id': (s,s,s,s), 'old_level': int, 'new_level': int, 'metrics': LinkMetrics}, ...]
+
+        混合架构设计：
+          - 拓扑变更：低频 → Redis Stream XREADGROUP → StalkerManager → RouteManager
+          - 性能变更：高频 → 进程内回调 → RouteManager（避免 Redis 成为瓶颈）
+        """
+        self._on_perf_updated = callback
+
+    # ──────────────────────────────────────────────
     # 链路注册
     # ──────────────────────────────────────────────
 
@@ -141,6 +168,7 @@ class PerformanceMonitor:
         self.calculator.reset(link_id)
         self.detector.reset_link(link_id)
         self.scheduler.remove_link(link_id)
+        self._previous_levels.pop(link_id, None)
 
     # ──────────────────────────────────────────────
     # 主循环
@@ -341,8 +369,9 @@ class PerformanceMonitor:
     # ──────────────────────────────────────────────
 
     def _calculate_and_update(self):
-        """遍历所有活跃链路，计算四指标 + 拥堵等级 + 异步写入 MySQL"""
+        """遍历所有活跃链路，计算四指标 + 拥堵等级 + 异步写入 MySQL + 进程内回调"""
         active_link_ids = self.calculator.get_active_link_ids()
+        changed: List[Dict[str, Any]] = []
 
         for link_id in active_link_ids:
             metrics = self.calculator.calculate(link_id)
@@ -354,6 +383,17 @@ class PerformanceMonitor:
             # 评估拥堵等级
             level = self.detector.evaluate(metrics)
 
+            # 检测拥堵等级变化（进程内回调触发条件）
+            old_level = self._previous_levels.get(link_id, -1)
+            if old_level != level:
+                changed.append({
+                    'link_id': link_id,
+                    'old_level': old_level,
+                    'new_level': level,
+                    'metrics': metrics,
+                })
+                self._previous_levels[link_id] = level
+
             # 存储最新结果
             with self._results_lock:
                 self._latest_metrics[link_id] = metrics
@@ -362,6 +402,14 @@ class PerformanceMonitor:
 
             # ── 异步写入 MySQL（fire-and-forget） ──
             self._enqueue_perf(link_id, metrics, level)
+
+        # ── 拥堵等级变化时触发进程内回调 ──
+        if changed and self._on_perf_updated:
+            try:
+                self._on_perf_updated(changed)
+            except Exception:
+                if self.logger:
+                    self.logger.exception("[PerfMonitor] _on_perf_updated callback failed")
 
     def _enqueue_perf(self, link_key: Tuple[int, int, int, int], metrics: LinkMetrics, level: int) -> None:
         """Fire-and-forget：将链路性能数据异步写入 MySQL perf_history 表"""

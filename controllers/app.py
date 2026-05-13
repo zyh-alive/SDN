@@ -200,6 +200,21 @@ class SDNController(app_manager.RyuApp):
         self.route_manager.set_perf_monitor(self.perf_monitor)
         self.route_manager.set_redis_client(self.redis_client)
 
+        # ── Phase 4: 混合架构 — 性能数据拥堵等级变化 → 进程内回调 → RouteManager ──
+        # 高频率的性能数据不经过 Redis Stream，直接进程内回调触发路由重算
+        def _on_perf_change(changes: List[Dict[str, Any]]) -> None:
+            """拥堵等级变化时触发路由重算（进程内回调，高频）"""
+            if self.logger:
+                for ch in changes:
+                    self.logger.info(
+                        "[app] Perf change: link %s level %d→%d",
+                        ch.get('link_id'), ch.get('old_level'), ch.get('new_level'),
+                    )
+            self.route_manager.recompute_all()
+
+        self.perf_monitor.set_on_perf_updated(_on_perf_change)
+        self.logger.info("🔄 Phase 4: PerfMonitor → RouteManager callback (in-process) registered")
+
         # ── Phase 4: 路由 → 拓扑变更回调（仅记录，不下发流表） ──
         # 拓扑变更 → recompute_all() → 缓存路由到内存。
         # 实际流表下发延迟到 ArpHandler 收到首包时：ARP 学习 → 查缓存 → 精确编译 → 下发
