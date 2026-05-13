@@ -35,6 +35,7 @@ import time
 import threading
 import queue
 import struct
+from typing import Any, Dict, List, Optional, Tuple
 
 # ryu-manager 将 controllers/app.py 作为独立文件加载，
 # 需手动将项目根目录加入 sys.path 以解析 controllers.* 和 modules.* 包
@@ -44,8 +45,8 @@ if _project_root not in sys.path:
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
-from ryu.controller.handler import set_ev_cls
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
+from ryu.controller.handler import set_ev_cls  # type: ignore[reportUnknownVariableType]
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
 
@@ -68,7 +69,7 @@ from modules.flow_table.deployer import DatapathRegistry, FlowDeployer
 class SDNController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any):
         super(SDNController, self).__init__(*args, **kwargs)
 
         # ── 前置安全过滤（包大小等基础检查） ──
@@ -88,13 +89,13 @@ class SDNController(app_manager.RyuApp):
 
         # 注入日志器到所有 Worker
         for worker in self.dispatcher.workers:
-            worker.set_logger(self.logger)
+            worker.logger = self.logger
 
         # ── 启动 Dispatcher + Worker 线程（多线程架构） ──
         self.dispatcher.start()
 
         # ── Phase 3: 初始化 Redis ──
-        self.redis_client = RedisClient(logger=self.logger)
+        self.redis_client = RedisClient(logger=self.logger) # Redis 用于存储拓扑快照和版本号，提供轻量级共享状态和历史记录功能
         self.redis_client.init_topology_keys()
 
         # ── Phase 3: 初始化 MySQL ──
@@ -127,7 +128,7 @@ class SDNController(app_manager.RyuApp):
         # ── Phase 3: 初始化 StalkerManager + RouteManager ──
         self.stalker_manager = StalkerManager(logger=self.logger)
         self.route_manager = RouteManager(logger=self.logger)
-        self.stalker_manager.register(self.route_manager, wake_order=0)
+        self.stalker_manager.register(self.route_manager, wake_order=0) #两个参数：被注册的盯梢者实例和唤醒顺序，数字越小越先被调用，这里 RouteManager 的唤醒顺序设置为 0，表示它将是第一个被通知的盯梢者
         self.logger.info("📡 Phase 3: StalkerManager + RouteManager registered")
 
         # ── Phase 4: 流表下发基础设施 ──
@@ -150,7 +151,7 @@ class SDNController(app_manager.RyuApp):
         self._start_lldp_drain_timer()
 
         # ── Phase 4: ARP 处理机专用队列（主控直推，不经过 Worker 流水线） ──
-        self.arp_queue = queue.Queue(maxsize=10000)
+        self.arp_queue: "queue.Queue[Any]" = queue.Queue(maxsize=10000)
 
         # ── Phase 4: ARP 处理机（西向队列消费者，首包触发路由查找） ──
         # 必须在 topology_processor 初始化之后创建（需要引用 topology_processor.graph）
@@ -230,9 +231,9 @@ class SDNController(app_manager.RyuApp):
 
         # 默认流表：所有包上送控制器
         match = parser.OFPMatch() # 创建一个空的匹配对象，表示匹配所有流量，ofpmatch表示OpenFlow 匹配结构（用来描述"匹配什么条件的包"）
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]  # type: ignore[reportUnknownVariableType]
         #动作为列表，因为一个流表可以有多action，OFPActionOutput表示发往哪个端口，这里是OFPP_CONTROLLER，表示发送到控制器，OFPCML_NO_BUFFER表示不缓存数据包，直接发送完整数据包到控制器
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]  # type: ignore[reportUnknownVariableType]
         #OFPIT_APPLY_ACTIONS表示立即执行动作，inst创建指令列表，这里只有一个指令，即应用上面定义的动作列表
 
         mod = parser.OFPFlowMod( #创建一个流表修改消息
@@ -246,6 +247,9 @@ class SDNController(app_manager.RyuApp):
         # ── Phase 2: 注册交换机到 LLDP 采集器 ──
         self.lldp_collector.register_switch(dpid, datapath)
 
+        # 清除黑名单：交换机重连后恢复 LLDP 处理
+        self.topology_processor.clear_blacklist_switch(dpid)
+
         # 同步预注册到拓扑校验器（避免"先有鸡还是先有蛋"死锁）
         self.topology_processor.validator.register_device(dpid_to_mac(dpid))
 
@@ -254,6 +258,64 @@ class SDNController(app_manager.RyuApp):
 
         self.logger.info(f"🔌 交换机 {dpid:016x} 已经连接到 (LLDP + FlowTable registered)")
 
+    @set_ev_cls(ofp_event.EventOFPStateChange, DEAD_DISPATCHER)  # type: ignore[attr-defined]
+    def switch_disconnected_handler(self, ev):
+        """
+        交换机断开事件处理器 — 级联清理四个模块：
+
+          dp_registry          → unregister(dpid)
+          lldp_collector       → unregister_switch(dpid)
+          topology_processor   → handle_switch_disconnected(dpid)
+          validator            → unregister_device(chassis_mac)
+        """
+        datapath = ev.datapath
+        dpid = datapath.id
+        chassis_mac = dpid_to_mac(dpid)
+
+        # 1. 流表注册表（停止对该交换机下发流表）
+        self.dp_registry.unregister(dpid)
+
+        # 2. LLDP 采集器（停止向该交换机发送 LLDP）
+        self.lldp_collector.unregister_switch(dpid)
+
+        # 3. 拓扑处理器（移除交换机 + 链路 → DELETE 事件 → Redis/MySQL/Stalker）
+        self.topology_processor.handle_switch_disconnected(dpid)
+
+        # 4. 拓扑校验器（从已知设备白名单中移除）
+        self.topology_processor.validator.unregister_device(chassis_mac)
+
+        self.logger.warning(f"🔌 交换机 {dpid:016x} 已断开 (all modules unregistered)")
+
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)  # type: ignore[attr-defined]
+    def port_status_handler(self, ev):
+        """
+        端口状态变更处理器 — 检测到端口 DOWN 时立即清除相关链路。
+
+        比 LLDP 超时（90s）快数个数量级（毫秒级响应）。
+        只处理 DOWN 事件；ADD/MODIFY/DELETE_AND_ADD 忽略。
+        """
+        msg = ev.msg
+        dpid = msg.datapath.id
+
+        # 仅处理端口 DOWN（链路删除 / 端口删除）
+        from ryu.ofproto.ofproto_v1_3 import OFPPR_DELETE, OFPPR_ADD
+        if msg.reason == OFPPR_ADD:
+            # 端口恢复：清除黑名单，允许后续 LLDP 重新发现该端口链路
+            self.topology_processor.clear_blacklist_port(dpid, msg.desc.port_no)
+            return
+        if msg.reason != OFPPR_DELETE:
+            return
+
+        port_no = msg.desc.port_no
+        self.topology_processor.handle_port_down(dpid, port_no)
+
+        # 同时从 LLDP 采集器的端口列表中移除该端口（不再向该端口发 LLDP）
+        self.lldp_collector.remove_port(dpid, port_no)
+
+        self.logger.warning(
+            f"🔌 Port {dpid:016x}:{port_no} 断开了 (link removed from topology)"
+        )
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)  # type: ignore[attr-defined]
     # PacketIn 事件处理器：EtherType 直接分向（LLDP→东向 RingBuffer, ARP/IP→西向 ArpHandler）
     def packet_in_handler(self, ev):
@@ -261,7 +323,7 @@ class SDNController(app_manager.RyuApp):
         datapath = msg.datapath
 
         # 主控上的安全过滤（快速检查包大小，避免明显无效包进入 Ring Buffer）
-        if not self.security_filter.filter(msg):
+        if not self.security_filter.filter(msg):  # type: ignore[reportUnknownMemberType]
             return
 
         raw_data = msg.data
@@ -269,23 +331,28 @@ class SDNController(app_manager.RyuApp):
             return
 
         # ── 2. EtherType 直接分向（无 metadata 依赖，不会丢失） ──
+        #原因在于metadata依赖可能会因为流表项过期或未安装而导致分类失败，而EtherType直接分向则完全基于数据包内容，不受流表状态影响，能够确保所有PacketIn消息都能正确分类到东向或西向通道，避免了潜在的丢包问题。
         ethertype = struct.unpack("!H", raw_data[12:14])[0]
+        #unpack函数用于从字节数据中解析出一个整数，"!H"表示按照网络字节序（大端）解析一个无符号短整数（2字节），
+        # raw_data[12:14]提取以太网帧中的EtherType字段，该字段位于以太网头部的第12和13字节位置，
+        # 解析出的ethertype将用于后续的分向逻辑，
+        # 根据不同的EtherType值将PacketIn消息分发到不同的处理模块（LLDP → 东向 RingBuffer, ARP/IP → 西向 ArpHandler）
 
         # ── 3. 提取公共元信息 ──
         try:
-            dpid = datapath.id
+            dpid: Any = datapath.id
         except Exception:
-            dpid = 0
+            dpid: Any = 0  # 如果无法提取 DPID，默认为 0（无效 DPID）
         try:
-            in_port = msg.match.get('in_port', 0) if msg.match else 0
+            in_port: Any = msg.match.get('in_port', 0) if msg.match else 0
         except Exception:
-            in_port = 0
+            in_port: Any = 0
 
         if ethertype == self.ETHERTYPE_LLDP:
             # ── 东向：LLDP → Ring Buffer → Dispatcher → Workers → topo_east + perf_east ──
             ok = self.ring_buffer.push(msg)
             if not ok:
-                self.logger.debug("[LLDP] Ring Buffer full, dropped")
+                self.logger.debug("[LLDP] Ring Buffer 满了, 开始丢弃")
             return
 
         # ── 西向：ARP/IP → 主控直推 → arp_queue → ArpHandler ──
@@ -304,14 +371,18 @@ class SDNController(app_manager.RyuApp):
         )
 
         try:
-            self.arp_queue.put_nowait(structured)
+            self.arp_queue.put_nowait(structured) 
+            #put_nowait方法尝试将一个元素放入队列中，
+            #如果队列已满，则会引发queue.Full异常，而不会阻塞等待空间变为可用。
+            # 这对于实时处理或不希望被阻塞的场景非常有用。在这里，StructuredMessage对象被放入arp_queue中，
+            # 供ArpHandler线程消费。如果队列已满，当前消息将被丢弃，并且会记录一个调试日志。
         except queue.Full:
             pass
 
         # ── 4. 定期输出统计（每 1000 包） ──
         total = self.ring_buffer.total_pushed
         if total % 1000 == 0:
-            self._log_stats()
+            self._log_stats() 
 
         # ── 5. 定期输出综合统计（每 10 秒） ──
         now = time.time()
@@ -322,7 +393,7 @@ class SDNController(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPStatsReply, MAIN_DISPATCHER)  # type: ignore[attr-defined]
     def stats_reply_handler(self, ev):
         """STATS_REPLY 事件处理器：将端口统计转发到 PerformanceMonitor"""
-        self.perf_monitor.handle_stats_reply(ev)
+        self.perf_monitor.handle_stats_reply(ev)  # type: ignore[reportUnknownMemberType]
 
     def _stats_request_loop(self):
         """
@@ -364,7 +435,7 @@ class SDNController(app_manager.RyuApp):
         ds = self.dispatcher.stats()
 
         # Worker 线程状态
-        worker_states = []
+        worker_states: List[str] = []
         for w in ds['workers']:
             worker_states.append(
                 f"W{w['worker_id']}(east={w['east_count']} "
@@ -469,33 +540,33 @@ class SDNController(app_manager.RyuApp):
     # 公共接口
     # ──────────────────────────────────────────────
 
-    def get_topo_east_queues(self):
+    def get_topo_east_queues(self) -> "List[queue.Queue[Any]]":
         """获取所有 Worker 的拓扑东向队列（供拓扑发现模块消费）"""
         return [w.topo_east_queue for w in self.dispatcher.workers]
 
-    def get_perf_east_queues(self):
+    def get_perf_east_queues(self) -> "List[queue.Queue[Any]]":
         """获取所有 Worker 的性能东向队列（供性能检测模块消费）"""
         return [w.perf_east_queue for w in self.dispatcher.workers]
 
-    def get_east_queues(self):
+    def get_east_queues(self) -> "List[queue.Queue[Any]]":
         """
         向后兼容：返回拓扑东向队列列表。
         新代码应使用 get_topo_east_queues() / get_perf_east_queues()。
         """
         return self.get_topo_east_queues()
 
-    def get_west_queues(self):
+    def get_west_queues(self) -> "List[queue.Queue[Any]]":
         """获取所有 Worker 的西向队列引用（供路由模块消费）"""
         return [w.west_queue for w in self.dispatcher.workers]
 
-    def get_topology(self) -> dict:
+    def get_topology(self) -> Dict[str, Any]:
         """获取当前拓扑图谱（JSON 可序列化）"""
         return self.topology_processor.get_topology()
 
-    def get_performance(self) -> dict:
+    def get_performance(self) -> Dict[str, Any]:
         """获取最新性能指标"""
         metrics, levels = self.perf_monitor.poll_results(timeout=1.0)
-        result = {}
+        result: Dict[str, Any] = {}
         for link_id, m in metrics.items():
             key = f"{link_id[0]:016x}:{link_id[1]}→{link_id[2]:016x}:{link_id[3]}"
             result[key] = {
@@ -508,7 +579,7 @@ class SDNController(app_manager.RyuApp):
     # Phase 4: 路由 → 编译 → 下发 闭环
     # ──────────────────────────────────────────────
 
-    def _on_routes_updated(self, summary: dict):
+    def _on_routes_updated(self, summary: Dict[str, Any]):
         """
         RouteManager 重算完成后的回调 — 仅记录日志，不下发流表。
 
@@ -529,8 +600,6 @@ class SDNController(app_manager.RyuApp):
         Args:
             summary: RouteManager.recompute_all() 的返回 dict
         """
-        routes = self.route_manager.get_all_routes()
-
         self.logger.info(
             f"[FlowDeploy] Topology changed — route cache updated "
             f"(routes={summary.get('routes', 0)} "

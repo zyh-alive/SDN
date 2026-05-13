@@ -50,11 +50,12 @@ class PerformanceMonitor:
       #   set_ev_cls(EventOFPStatsReply) → monitor.handle_stats_reply(ev)
     """
 
-    # 结果轮询间隔
-    RESULT_POLL_INTERVAL = 1.0
+    CalculatorType = MetricsCalculator
+    DetectorType = EWMADetector
+    SchedulerType = AdaptiveScheduler
 
-    def __init__(self, east_queues: List, lldp_collector=None,
-                 dp_registry=None, logger=None, mysql_writer=None):
+    def __init__(self, east_queues: List[Any], lldp_collector: Any = None,
+                 dp_registry: Any = None, logger: Any = None, mysql_writer: Any = None):
         """
         Args:
             east_queues: Worker 的 perf_east_queue 列表
@@ -63,11 +64,11 @@ class PerformanceMonitor:
             logger: 日志器
             mysql_writer: MySQLWriterThread 实例
         """
-        self.east_queues = east_queues
-        self.lldp_collector = lldp_collector
-        self.dp_registry = dp_registry
-        self.logger = logger
-        self._mysql_writer = mysql_writer
+        self.east_queues: List[Any] = east_queues
+        self.lldp_collector: Any = lldp_collector
+        self.dp_registry: Any = dp_registry
+        self.logger: Any = logger
+        self._mysql_writer: Any = mysql_writer
 
         # 子组件
         self.calculator = MetricsCalculator()
@@ -75,20 +76,16 @@ class PerformanceMonitor:
         self.scheduler = AdaptiveScheduler()
 
         # 已知链路集合
-        self._known_links: Set[Tuple] = set()
+        self._known_links: Set[Tuple[int, int, int, int]] = set()
 
         # STATS_REQUEST 待发送队列
         # [(dpid, port_no, link_id, timestamp)]
-        self._pending_requests: List[Tuple[int, int, Tuple, float]] = []
+        self._pending_requests: List[Tuple[int, int, Tuple[int, int, int, int], float]] = []
         self._req_lock = threading.Lock()
 
-        # LLDP 封包顺序跟踪：记录 switch_send 顺序以使 link_id 映射一致
-        # {dpid: last_sent_port}  — 用于在 perf_east_queue 消费时推断 dst
-        self._last_lldp_sent: Dict[int, int] = {}
-
         # 最新检测结果
-        self._latest_metrics: Dict[Tuple, LinkMetrics] = {}
-        self._latest_levels: Dict[Tuple, int] = {}
+        self._latest_metrics: Dict[Tuple[int, int, int, int], LinkMetrics] = {}
+        self._latest_levels: Dict[Tuple[int, int, int, int], int] = {}
         self._results_lock = threading.Lock()
         self._results_available = threading.Condition(self._results_lock)
 
@@ -131,13 +128,13 @@ class PerformanceMonitor:
     # ──────────────────────────────────────────────
 
     def register_link(self, link_id: Tuple[int, int, int, int]):
-        """注册链路（由拓扑发现模块调用）"""
+        """注册链路（保留供拓扑发现模块显式调用；自发现模式已覆盖常规场景）"""
         self._known_links.add(link_id)
         rev_key = (link_id[2], link_id[3], link_id[0], link_id[1])
         self._known_links.add(rev_key)
 
     def unregister_link(self, link_id: Tuple[int, int, int, int]):
-        """移除链路"""
+        """移除链路（保留供拓扑发现模块显式调用）"""
         self._known_links.discard(link_id)
         rev_key = (link_id[2], link_id[3], link_id[0], link_id[1])
         self._known_links.discard(rev_key)
@@ -192,7 +189,7 @@ class PerformanceMonitor:
                 consumed += 1
         return consumed
 
-    def _process_lldp_message(self, structured_msg) -> None:
+    def _process_lldp_message(self, structured_msg: Any) -> None:
         """
         处理 perf_east_queue 中的 LLDP 分组消息
 
@@ -230,6 +227,12 @@ class PerformanceMonitor:
 
         link_id = (src_dpid, src_port, dst_dpid, dst_port)
 
+        # 自动注册链路到 _known_links（从 LLDP 帧自发现，不依赖拓扑模块调用 register_link）
+        # 这对 STATS_REQUEST 调度和 STATS_REPLY 端口→链路映射都是必需的
+        self._known_links.add(link_id)
+        rev_link_id = (dst_dpid, dst_port, src_dpid, src_port)
+        self._known_links.add(rev_link_id)
+
         # 记录 LLDP 接收 → 时延
         delay_ms = self.calculator.record_lldp_recv(
             src_dpid, src_port, dst_dpid, dst_port)
@@ -263,7 +266,7 @@ class PerformanceMonitor:
 
             self.scheduler.record_sample(link_id, now)
 
-    def drain_pending_requests(self) -> list:
+    def drain_pending_requests(self) -> List[Tuple[int, int, Tuple[int, int, int, int], float]]:
         """
         取出并清空 STATS_REQUEST 待发送队列
 
@@ -360,14 +363,14 @@ class PerformanceMonitor:
             # ── 异步写入 MySQL（fire-and-forget） ──
             self._enqueue_perf(link_id, metrics, level)
 
-    def _enqueue_perf(self, link_key: Tuple, metrics: LinkMetrics, level: int):
+    def _enqueue_perf(self, link_key: Tuple[int, int, int, int], metrics: LinkMetrics, level: int) -> None:
         """Fire-and-forget：将链路性能数据异步写入 MySQL perf_history 表"""
         if self._mysql_writer is None:
             return
         # link_id: 格式化为 "{src_dpid:x}:{src_port}→{dst_dpid:x}:{dst_port}"
         link_id_str = (f"{link_key[0]:x}:{link_key[1]}"
                        f"→{link_key[2]:x}:{link_key[3]}")
-        row = {
+        row: Dict[str, Any] = {
             'link_id': link_id_str,
             'throughput': metrics.throughput,
             'delay': metrics.delay,
@@ -381,7 +384,7 @@ class PerformanceMonitor:
     # 结果查询
     # ──────────────────────────────────────────────
 
-    def poll_results(self, timeout: Optional[float] = None) -> Tuple[Dict, Dict]:
+    def poll_results(self, timeout: Optional[float] = None) -> Tuple[Dict[Tuple[int, int, int, int], LinkMetrics], Dict[Tuple[int, int, int, int], int]]:
         """轮询最新检测结果（阻塞）"""
         with self._results_lock:
             if not self._latest_metrics and timeout is not None:
@@ -390,17 +393,17 @@ class PerformanceMonitor:
             levels = dict(self._latest_levels)
         return metrics, levels
 
-    def get_latest_metrics(self) -> Dict[Tuple, LinkMetrics]:
+    def get_latest_metrics(self) -> Dict[Tuple[int, int, int, int], LinkMetrics]:
         """获取最新指标快照（非阻塞）"""
         with self._results_lock:
             return dict(self._latest_metrics)
 
-    def get_latest_levels(self) -> Dict[Tuple, int]:
+    def get_latest_levels(self) -> Dict[Tuple[int, int, int, int], int]:
         """获取最新拥堵等级（非阻塞）"""
         with self._results_lock:
             return dict(self._latest_levels)
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         return {
             "total_consumed": self._total_consumed,
             "total_lldp_matched": self._total_lldp_matched,

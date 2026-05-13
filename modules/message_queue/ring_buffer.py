@@ -10,7 +10,7 @@ SPSC Ring Buffer（单生产者单消费者环形缓冲区）
 import collections
 import threading
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 class RingBuffer:
@@ -33,7 +33,7 @@ class RingBuffer:
             capacity: 缓冲区最大容量
             name: 缓冲区名称（用于日志）
         """
-        self._deque = collections.deque(maxlen=capacity) #双端队列，设置最大长度为 capacity，超过时自动丢弃最旧元素
+        self._deque: collections.deque[Any] = collections.deque(maxlen=capacity) #双端队列，设置最大长度为 capacity，超过时自动丢弃最旧元素
         self._lock = threading.Lock()       # 仅保护 push 端
         self._not_empty = threading.Condition(threading.Lock())  #消费者等待新数据的条件变量
         self._capacity = capacity
@@ -45,7 +45,7 @@ class RingBuffer:
         self.total_dropped = 0              # 因满而丢弃的消息数
         self._start_time = time.time()
 
-    def push(self, item) -> bool:
+    def push(self, item: Any) -> bool:
         """
         生产者写入（主控线程调用）
 
@@ -71,7 +71,7 @@ class RingBuffer:
 
         return not dropped
 
-    def pop(self, timeout: Optional[float] = None):
+    def pop(self, timeout: Optional[float] = None) -> Any:
         """
         消费者阻塞读取（Dispatcher 线程调用）
 
@@ -93,20 +93,6 @@ class RingBuffer:
             self.total_popped += 1
             return item
 
-    def pop_nowait(self):
-        """
-        非阻塞出队
-
-        Returns:
-            消息对象，队列为空返回 None
-        """
-        with self._not_empty:
-            if len(self._deque) == 0:
-                return None
-            item = self._deque.popleft()
-            self.total_popped += 1
-            return item
-
     @property
     def size(self) -> int:
         """当前队列大小"""
@@ -114,16 +100,11 @@ class RingBuffer:
             return len(self._deque)
 
     @property
-    def is_empty(self) -> bool:
-        """队列是否为空"""
-        return self.size == 0
-
-    @property
     def capacity(self) -> int:
         """最大容量"""
         return self._capacity
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         """获取运行时统计"""
         elapsed = max(time.time() - self._start_time, 0.001)
         return {

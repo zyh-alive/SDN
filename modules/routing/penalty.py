@@ -25,7 +25,7 @@
 遵循"一个功能一个文件"原则。
 """
 
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 
 # ── 惩罚系数（可调） ──
@@ -173,7 +173,7 @@ def apply_prediction_penalty(
 if __name__ == "__main__":
     import sys
 
-    errors = []
+    errors: List[str] = []
 
     # ── 测试 1：L=0 无惩罚 ──
     d, j, l, t = apply_penalty(10.0, 5.0, 0.5, 100_000_000.0, 0)

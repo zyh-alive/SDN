@@ -14,14 +14,14 @@
 from __future__ import annotations
 
 import heapq
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 # ──────────────────────────────────────────────
 # 内部工具函数
 # ──────────────────────────────────────────────
 
-def _build_adjacency(graph: dict) -> Dict[int, Set[int]]:
+def _build_adjacency(graph: Dict[str, Any]) -> Dict[int, Set[int]]:
     """从 TopologyGraph.to_dict() 图谱构建无向邻接表。
 
     仅包含 status == "UP" 的链路。多条物理链路（不同端口）坍缩为一条逻辑边。
@@ -118,7 +118,7 @@ def _filter_disjunction(
 # ──────────────────────────────────────────────
 
 def yen_ksp(
-    graph: dict,
+    graph: Dict[str, Any],
     src: int,
     dst: int,
     K: int = 5,

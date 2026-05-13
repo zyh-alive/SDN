@@ -1,3 +1,6 @@
+# type: ignore[reportUnknownVariableType,reportUnknownMemberType]
+# ^^ Mininet 库无类型存根 — suppress 所有 Unknown 诊断
+
 """
 Mininet 简易测试拓扑 — 端到端验证
 

@@ -25,7 +25,7 @@ import struct
 import threading
 import time
 import queue
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from modules.message_queue.worker import StructuredMessage
 
@@ -40,8 +40,6 @@ IP_HDR_MIN_LEN = 20
 
 # ARP 老化时间（秒）
 ARP_ENTRY_TTL = 300.0
-# 泛洪广播域（所有交换机端口，排除入口）
-FLOOD_ALL = 0xFFFFFFFF
 
 
 class HostEntry:
@@ -71,12 +69,12 @@ class ArpHandler:
 
     def __init__(
         self,
-        west_queues: List[queue.Queue],
-        dp_registry=None,               # DatapathRegistry
-        route_manager=None,             # RouteManager
-        flow_deployer=None,             # FlowDeployer
-        topology_graph=None,            # TopologyGraph
-        logger=None,
+        west_queues: List[Any],
+        dp_registry: Any = None,               # DatapathRegistry
+        route_manager: Any = None,             # RouteManager
+        flow_deployer: Any = None,             # FlowDeployer
+        topology_graph: Any = None,            # TopologyGraph
+        logger: Any = None,
     ):
         """
         Args:
@@ -88,13 +86,13 @@ class ArpHandler:
             logger:         日志记录器
         """
         import logging
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger: Any = logger or logging.getLogger(__name__)
 
-        self._west_queues = west_queues
-        self._dp_registry = dp_registry
-        self._route_manager = route_manager
-        self._flow_deployer = flow_deployer
-        self._topology_graph = topology_graph
+        self._west_queues: List[Any] = west_queues
+        self._dp_registry: Any = dp_registry
+        self._route_manager: Any = route_manager
+        self._flow_deployer: Any = flow_deployer
+        self._topology_graph: Any = topology_graph
 
         # 主机学习表
         #   mac_table:  {mac_str: HostEntry}
@@ -104,7 +102,7 @@ class ArpHandler:
         self._table_lock = threading.Lock()
 
         # 已下发流表的 (src_ip, dst_ip) 集合（避免重复下发）
-        self._deployed_flows: set = set()
+        self._deployed_flows: Set[Tuple[str, str]] = set()
         self._deployed_lock = threading.Lock()
 
         # ARP 泛洪去重：{(src_ip, target_ip, dpid): last_flood_time}
@@ -213,7 +211,6 @@ class ArpHandler:
             return
 
         # 解析以太网头
-        eth_dst = _mac_bytes_to_str(raw[0:6])
         eth_src = _mac_bytes_to_str(raw[6:12])
         ethertype = struct.unpack("!H", raw[12:14])[0]
 
@@ -246,7 +243,7 @@ class ArpHandler:
             self._handle_arp_reply(msg, sender_mac, sender_ip, target_mac, target_ip)
         # opcode 其他值忽略
 
-    def _handle_arp_request(self, msg, sender_mac, sender_ip, target_mac, target_ip):
+    def _handle_arp_request(self, msg: Any, sender_mac: str, sender_ip: str, target_mac: str, target_ip: str) -> None:
         """处理 ARP Request — 已知目标代答，未知则泛洪（带去重）。"""
         target_entry = self._lookup_ip(target_ip)
         if target_entry is not None and target_entry.mac != "00:00:00:00:00:00":
@@ -283,7 +280,7 @@ class ArpHandler:
             self._flood_packet(msg)
             self._total_floods += 1
 
-    def _handle_arp_reply(self, msg, sender_mac, sender_ip, target_mac, target_ip):
+    def _handle_arp_reply(self, msg: Any, sender_mac: str, sender_ip: str, target_mac: str, target_ip: str) -> None:
         """
         处理 ARP Reply — 学习应答者（sender），转发 Reply 到请求者（target）。
 
@@ -336,7 +333,6 @@ class ArpHandler:
             return
 
         # 解析以太网头
-        eth_dst = _mac_bytes_to_str(raw[0:6])
         eth_src = _mac_bytes_to_str(raw[6:12])
         ethertype = struct.unpack("!H", raw[12:14])[0]
 
@@ -397,7 +393,6 @@ class ArpHandler:
             from modules.flow_table.compiler import (
                 compile_path_rules,
                 PRIORITY_PRIMARY,
-                PRIORITY_ARP,
             )
 
             if src_host.dpid == dst_host.dpid:
@@ -416,7 +411,7 @@ class ArpHandler:
                     return
 
                 # 获取拓扑图谱
-                graph = {}
+                graph: Dict[str, Any] = {}
                 if self._topology_graph:
                     graph = self._topology_graph.get_full()
 
@@ -521,10 +516,10 @@ class ArpHandler:
         try:
             from modules.flow_table.compiler import _find_out_port, _find_in_port
             # 获取当前拓扑图谱
-            graph = {}
+            graph: Dict[str, Any] = {}
             if self._topology_graph:
                 graph = self._topology_graph.get_full()
-            links = graph.get("links", {})
+            links: Dict[str, Any] = graph.get("links", {})
 
             # 首跳交换机就是 src_host.dpid
             # 需要找到该交换机的出端口（朝向下一跳）
@@ -608,11 +603,6 @@ class ArpHandler:
                 entry.last_seen = time.time()
                 self._ip_table[ip] = mac
 
-    def _lookup_mac(self, mac: str) -> Optional[HostEntry]:
-        """按 MAC 查找主机条目。"""
-        with self._table_lock:
-            return self._mac_table.get(mac)
-
     def _lookup_ip(self, ip: str) -> Optional[HostEntry]:
         """按 IP 查找主机条目。"""
         with self._table_lock:
@@ -624,7 +614,7 @@ class ArpHandler:
     def _clean_stale_entries(self):
         """清理过期的主机学习条目。"""
         now = time.time()
-        stale_macs = []
+        stale_macs: List[str] = []
         with self._table_lock:
             for mac, entry in self._mac_table.items():
                 if now - entry.last_seen > ARP_ENTRY_TTL:
@@ -724,7 +714,7 @@ class ArpHandler:
     #  PacketOut 工具
     # ──────────────────────────────────────────────
 
-    def _packet_out(self, dp, data: bytes, in_port: int, out_port: Optional[int] = None):
+    def _packet_out(self, dp: Any, data: bytes, in_port: int, out_port: Optional[int] = None) -> None:
         """
         发送 PacketOut 消息到交换机。
         """
@@ -748,23 +738,23 @@ class ArpHandler:
     #  依赖注入（延迟注入场景）
     # ──────────────────────────────────────────────
 
-    def set_dp_registry(self, dp_registry):
+    def set_dp_registry(self, dp_registry: Any) -> None:
         self._dp_registry = dp_registry
 
-    def set_route_manager(self, route_manager):
+    def set_route_manager(self, route_manager: Any) -> None:
         self._route_manager = route_manager
 
-    def set_flow_deployer(self, flow_deployer):
+    def set_flow_deployer(self, flow_deployer: Any) -> None:
         self._flow_deployer = flow_deployer
 
-    def set_topology_graph(self, topology_graph):
+    def set_topology_graph(self, topology_graph: Any) -> None:
         self._topology_graph = topology_graph
 
     # ──────────────────────────────────────────────
     #  统计
     # ──────────────────────────────────────────────
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         with self._table_lock:
             host_count = len(self._mac_table)
         return {

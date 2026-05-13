@@ -1,3 +1,5 @@
+# type: ignore[reportUnknownVariableType,reportUnknownMemberType]
+# ^^ SQLAlchemy Column[Unknown] — 库无类型存根，suppress 所有 Unknown 诊断
 """性能历史表 — PerfHistory ORM 模型。
 
 每链路每次采样一行。

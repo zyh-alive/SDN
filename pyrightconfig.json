@@ -1,0 +1,25 @@
+{
+    "include": [
+        "controllers",
+        "modules",
+        "storage",
+        "topology"
+    ],
+    "exclude": [
+        "**/node_modules",
+        "**/__pycache__",
+        "**/.*",
+        ".venv",
+        ".git"
+    ],
+    "ignore": [
+        "/usr/**"
+    ],
+    "reportMissingImports": false,
+    "typeCheckingMode": "basic",
+    "reportUnknownVariableType": false,
+    "reportUnknownMemberType": false,
+    "reportUnknownArgumentType": false,
+    "reportUnknownParameterType": false,
+    "reportUnknownLambdaType": false
+}

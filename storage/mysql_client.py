@@ -19,7 +19,7 @@ import queue
 import threading
 import time
 import uuid
-from typing import Callable, List
+from typing import Any, Callable, Dict, List
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -96,7 +96,7 @@ class MySQLClient:
         except Exception:
             return False
 
-    def insert_changelog_batch(self, rows: list[dict]) -> int:
+    def   insert_changelog_batch(self, rows: List[Dict[str, Any]]) -> int:
         """批量插入拓扑变更日志（executemany 单次网络往返）
 
         Args:
@@ -130,7 +130,7 @@ class MySQLClient:
                 self.logger.exception("[MySQLClient] Batch insert failed (%d rows)", len(rows))
             raise
 
-    def insert_perf_batch(self, rows: list[dict]) -> int:
+    def insert_perf_batch(self, rows: List[Dict[str, Any]]) -> int:
         """批量插入性能历史数据（executemany 单次网络往返）
 
         Args:
@@ -187,7 +187,7 @@ class MySQLWriterThread:
     def __init__(
         self,
         mysql_client: MySQLClient,
-        write_fn: Callable[[List[dict]], int] | None = None,
+        write_fn: Callable[[List[Dict[str, Any]]], int] | None = None,
         flush_interval: float = 1.0,
         batch_size: int = 200,
         queue_maxsize: int = 10000,
@@ -200,7 +200,7 @@ class MySQLWriterThread:
         self._flush_interval = flush_interval
         self._batch_size = batch_size
 
-        self._queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+        self._queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=queue_maxsize)
         self._running = False
         self._thread: threading.Thread | None = None
 
@@ -213,7 +213,7 @@ class MySQLWriterThread:
 
     # ── 生产者接口 ─────────────────────────────────
 
-    def enqueue(self, row_dict: dict):
+    def enqueue(self, row_dict: Dict[str, Any]) -> None:
         """Fire-and-forget：放入队列后立即返回。
 
         Args:
@@ -222,7 +222,7 @@ class MySQLWriterThread:
                         性能历史: link_id/throughput/delay/jitter/...）
         """
         try:
-            self._queue.put_nowait(row_dict)
+            self._queue.put_nowait(row_dict) #尝试将 row_dict 放入队列，如果队列已满则抛出 queue.Full 异常
             with self._lock:
                 self._total_enqueued += 1
         except queue.Full:
@@ -272,7 +272,7 @@ class MySQLWriterThread:
 
     def _run_loop(self):
         """主循环：定期批量消费队列"""
-        batch: list = []
+        batch: List[Dict[str, Any]] = []
         last_flush = time.time()
 
         while self._running:
@@ -300,7 +300,7 @@ class MySQLWriterThread:
                     self.logger.exception("[MySQLWriter] Error in loop")
                 time.sleep(0.5)
 
-    def _write_batch(self, batch: list):
+    def _write_batch(self, batch: List[Dict[str, Any]]):
         """写入一批数据到 MySQL（通过 write_fn 委托到具体表）"""
         if not batch:
             return
@@ -316,7 +316,7 @@ class MySQLWriterThread:
 
     def _flush_all(self):
         """排空队列中所有剩余数据（stop 时调用）"""
-        remaining: list = []
+        remaining: List[Dict[str, Any]] = []
         while True:
             try:
                 remaining.append(self._queue.get_nowait())
@@ -327,7 +327,7 @@ class MySQLWriterThread:
 
     # ── 统计 ───────────────────────────────────────
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, int]:
         with self._lock:
             return {
                 "enqueued": self._total_enqueued,

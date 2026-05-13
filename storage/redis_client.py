@@ -102,7 +102,7 @@ class RedisClient:
     def ping(self) -> bool:
         """健康检查"""
         try:
-            result = self._client.ping()
+            result = self._client.ping()  # type: ignore[reportUnknownMemberType]
             return bool(result)
         except Exception:
             return False

@@ -35,7 +35,7 @@ class DatapathRegistry:
         self._dps: Dict[int, Any] = {}
         self._lock = threading.Lock()
 
-    def register(self, dpid: int, datapath) -> None:
+    def register(self, dpid: int, datapath: Any) -> None:
         """注册或更新交换机 datapath。"""
         with self._lock:
             self._dps[dpid] = datapath
@@ -49,11 +49,6 @@ class DatapathRegistry:
         """获取 datapath 对象。"""
         with self._lock:
             return self._dps.get(dpid)
-
-    def get_all(self) -> Dict[int, Any]:
-        """获取所有 datapath（副本）。"""
-        with self._lock:
-            return dict(self._dps)
 
     def __contains__(self, dpid: int) -> bool:
         with self._lock:
@@ -89,14 +84,14 @@ class FlowDeployer:
     COOKIE_MASK = 0xF000  # 高 4 bits 区分用途
 
     def __init__(self, dp_registry: Optional[DatapathRegistry] = None,
-                 logger=None):
+                 logger: Any = None):
         """
         Args:
             dp_registry:  交换机 datapath 注册表
             logger:       日志记录器
         """
         self._dp_registry = dp_registry if dp_registry is not None else DatapathRegistry()
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger: Any = logger or logging.getLogger(__name__)
 
         # 已下发规则追踪：{(dpid, cookie, table_id): [rule_ids]}
         self._deployed: Dict[Tuple[int, int, int], List[str]] = {}
@@ -114,9 +109,6 @@ class FlowDeployer:
     @property
     def dp_registry(self) -> DatapathRegistry:
         return self._dp_registry
-
-    def set_dp_registry(self, registry: DatapathRegistry) -> None:
-        self._dp_registry = registry
 
     # ──────────────────────────────────────────────
     #  部署 API
@@ -236,25 +228,6 @@ class FlowDeployer:
             )
             return 0
 
-    def clean_switch(self, dpid: int, table_id: int = 0) -> int:
-        """
-        清理交换机上所有由本控制器安装的流表规则。
-
-        分别清除路由、限速、队列等各类 cookie 段。
-        """
-        removed = 0
-        for cookie_base in [
-            self.COOKIE_ROUTE_PRIMARY,
-            self.COOKIE_ROUTE_BACKUP,
-            self.COOKIE_ROUTE_P1,
-            self.COOKIE_METER,
-            self.COOKIE_QUEUE,
-        ]:
-            removed += self.remove_rules_by_cookie(
-                dpid, cookie_base, table_id=table_id
-            )
-        return removed
-
     # ──────────────────────────────────────────────
     #  单条下发
     # ──────────────────────────────────────────────
@@ -279,7 +252,7 @@ class FlowDeployer:
         match = parser.OFPMatch(**match_kwargs) if match_kwargs else parser.OFPMatch()
 
         # 构建 actions
-        actions = []
+        actions: List[Any] = []
         for act in rule.actions:
             if act["type"] == "OUTPUT":
                 actions.append(
@@ -298,7 +271,7 @@ class FlowDeployer:
                     parser.OFPActionSetField(**act["field"])
                 )
 
-        instructions = []
+        instructions: List[Any] = []
         if actions:
             instructions.append(
                 parser.OFPInstructionActions(
@@ -331,7 +304,7 @@ class FlowDeployer:
         with self._deployed_lock:
             self._deployed.setdefault(key, []).append(rule.rule_id)
 
-    def _remove_single_cookie(self, dp, cookie: int, table_id: int) -> None:
+    def _remove_single_cookie(self, dp: Any, cookie: int, table_id: int) -> None:
         """删除交换机上匹配 cookie 的单条规则。"""
         try:
             ofproto = dp.ofproto
@@ -390,7 +363,7 @@ class FlowDeployer:
     #  统计
     # ──────────────────────────────────────────────
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         with self._deployed_lock:
             tracked = sum(len(v) for v in self._deployed.values())
         return {

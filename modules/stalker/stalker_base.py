@@ -6,11 +6,13 @@
   - 子类只需重写此方法即可被 StalkerManager 自动调用
 """
 
+from typing import Any, List
+
 
 class Stalker:
     """盯梢者基类"""
 
-    def on_events(self, events: list):
+    def on_events(self, events: List[Any]) -> None:
         """
         接收拓扑变更事件列表（批量）。
 

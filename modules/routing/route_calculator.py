@@ -38,10 +38,6 @@ DEFAULT_METRICS: Dict[str, float] = {
 # 拥堵等级 L=3 链路的效用值乘数
 SEVERE_DISCOUNT = 0.2
 
-# U_final 整合参数
-ZETA = 0.7       # 当前效用值权重
-LAMBDA = 0.1     # 预测衰减因子
-
 
 class PathCandidate:
     """
@@ -92,14 +88,14 @@ class RouteCalculator:
         # results["p1"]["cache"]     → PathCandidate (不下发)
     """
 
-    def __init__(self, logger=None, k: int = 5):
+    def __init__(self, logger: Any = None, k: int = 5):
         """
         Args:
             logger: 日志记录器
             k:      KSP 候选数（默认 5）
         """
         import logging
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger: Any = logger or logging.getLogger(__name__)
         self.k = k
         self._stat_cache_hits = 0
         self._stat_total_computes = 0
@@ -110,13 +106,13 @@ class RouteCalculator:
 
     def compute(
         self,
-        graph: dict,
+        graph: Dict[str, Any],
         src: int,
         dst: int,
         profile: str = "other",
-        metrics: Optional[Dict[Tuple, Any]] = None,
-        levels: Optional[Dict[Tuple, int]] = None,
-        pred_metrics: Optional[Dict[Tuple, Any]] = None,
+        metrics: Optional[Dict[Tuple[int, int, int, int], Any]] = None,
+        levels: Optional[Dict[Tuple[int, int, int, int], int]] = None,
+        pred_metrics: Optional[Dict[Tuple[int, int, int, int], Any]] = None,
         prediction_age: float = 0.0,
     ) -> Dict[str, Any]:
         """
@@ -191,11 +187,11 @@ class RouteCalculator:
     def _evaluate_path(
         self,
         path: List[int],
-        graph: dict,
+        graph: Dict[str, Any],
         profile: str,
-        metrics: Dict[Tuple, Any],
-        levels: Dict[Tuple, int],
-        pred_metrics: Dict[Tuple, Any],
+        metrics: Dict[Tuple[int, int, int, int], Any],
+        levels: Dict[Tuple[int, int, int, int], int],
+        pred_metrics: Dict[Tuple[int, int, int, int], Any],
         prediction_age: float,
     ) -> PathCandidate:
         """
@@ -267,7 +263,7 @@ class RouteCalculator:
         return cand
 
     def _path_to_edges(
-        self, path: List[int], graph: dict
+        self, path: List[int], graph: Dict[str, Any]
     ) -> List[Tuple[int, int, int, int]]:
         """
         将路径转换为边键列表 (src_dpid, src_port, dst_dpid, dst_port)。
@@ -301,8 +297,8 @@ class RouteCalculator:
     def _aggregate_edge_metrics(
         self,
         edges: List[Tuple[int, int, int, int]],
-        metrics: Dict[Tuple, Any],
-        levels: Dict[Tuple, int],
+        metrics: Dict[Tuple[int, int, int, int], Any],
+        levels: Dict[Tuple[int, int, int, int], int],
         has_severe: bool,
     ) -> Dict[str, float]:
         """
@@ -322,9 +318,9 @@ class RouteCalculator:
         Returns:
             {"throughput": float, "delay": float, "jitter": float, "packet_loss": float}
         """
-        throughputs = []
-        delays = []
-        jitters = []
+        throughputs: List[float] = []
+        delays: List[float] = []
+        jitters: List[float] = []
         loss_remaining = 1.0
 
         for edge_key in edges:
@@ -389,7 +385,7 @@ class RouteCalculator:
         """
         is_p0 = profile in ("realtime", "interactive")
 
-        result = {
+        result: Dict[str, Any] = {
             "profile": profile,
             "is_p0": is_p0,
             "p0": {"primary": None, "backup": None},
@@ -456,7 +452,7 @@ class RouteCalculator:
             "stats": {"total_computes": self._stat_total_computes, "cache_hits": 0},
         }
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         return {
             "total_computes": self._stat_total_computes,
             "cache_hits": self._stat_cache_hits,
@@ -467,7 +463,7 @@ class RouteCalculator:
 # 自测
 # ═══════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # type: ignore[reportUnknownVariableType,reportUnknownArgumentType]
     import sys
 
     errors: List[str] = []
@@ -475,7 +471,7 @@ if __name__ == "__main__":
     # ── 构造测试拓扑（NSFNET 风格） ──
     # 交换机: 1, 2, 3, 4, 5
     # 链路:  1-2, 1-3, 2-4, 3-4, 4-5
-    test_graph = {
+    test_graph: Dict[str, Any] = {
         "switches": {},
         "links": {
             (1, 1, 2, 1): {"src_dpid": 1, "dst_dpid": 2, "src_port": 1, "dst_port": 1, "status": "UP"},
@@ -487,8 +483,8 @@ if __name__ == "__main__":
     }
 
     # 性能数据（无拥堵）
-    test_metrics: Dict[Tuple, Any] = {}
-    test_levels: Dict[Tuple, int] = {}
+    test_metrics: Dict[Tuple[int, int, int, int], Any] = {}
+    test_levels: Dict[Tuple[int, int, int, int], int] = {}
 
     calc = RouteCalculator(k=5)
 
@@ -520,7 +516,7 @@ if __name__ == "__main__":
     errors.append(f"✓ L=3 拥堵降权 (primary={primary_path})")
 
     # ── 测试 4：无路径 ──
-    isolated_graph = {"switches": {}, "links": {}}
+    isolated_graph: Dict[str, Any] = {"switches": {}, "links": {}}
     result = calc.compute(isolated_graph, 1, 99, profile="realtime",
                           metrics={}, levels={})
     assert result["p0"]["primary"] is None

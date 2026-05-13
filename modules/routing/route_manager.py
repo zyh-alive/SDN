@@ -47,10 +47,10 @@ class RouteManager(Stalker):
 
     def __init__(
         self,
-        topology_graph=None,
-        perf_monitor=None,
-        redis_client=None,
-        logger=None,
+        topology_graph: Any = None,
+        perf_monitor: Any = None,
+        redis_client: Any = None,
+        logger: Any = None,
     ):
         """
         Args:
@@ -59,12 +59,12 @@ class RouteManager(Stalker):
             redis_client:   RedisClient 实例（未来用于获取预测数据）
             logger:         日志记录器
         """
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger: Any = logger or logging.getLogger(__name__)
 
         # 外部依赖（注入）
-        self._topology_graph = topology_graph
-        self._perf_monitor = perf_monitor
-        self._redis_client = redis_client
+        self._topology_graph: Any = topology_graph
+        self._perf_monitor: Any = perf_monitor
+        self._redis_client: Any = redis_client
 
         # 路由计算引擎
         self._calculator = RouteCalculator(logger=self.logger, k=5)
@@ -87,15 +87,15 @@ class RouteManager(Stalker):
     #  依赖注入（构造函数之外的可选注入）
     # ──────────────────────────────────────────────
 
-    def set_topology_graph(self, graph):
+    def set_topology_graph(self, graph: Any) -> None:
         """注入拓扑图谱（在 app.py 初始化时调用）。"""
         self._topology_graph = graph
 
-    def set_perf_monitor(self, monitor):
+    def set_perf_monitor(self, monitor: Any) -> None:
         """注入性能监控器（在 app.py 初始化时调用）。"""
         self._perf_monitor = monitor
 
-    def set_redis_client(self, client):
+    def set_redis_client(self, client: Any) -> None:
         """注入 Redis 客户端。"""
         self._redis_client = client
 
@@ -114,7 +114,7 @@ class RouteManager(Stalker):
     #  Stalker 接口
     # ──────────────────────────────────────────────
 
-    def on_events(self, events: list) -> Dict[str, Any]:
+    def on_events(self, events: List[Any]) -> Dict[str, Any]:
         """
         接收拓扑变更事件，触发路由重算。
 
@@ -151,15 +151,15 @@ class RouteManager(Stalker):
         graph = self._topology_graph.get_full()
 
         # 获取性能数据
-        metrics = {}
-        levels = {}
+        metrics: Dict[Tuple[int, int, int, int], Any] = {}
+        levels: Dict[Tuple[int, int, int, int], int] = {}
         if self._perf_monitor:
             metrics = self._perf_monitor.get_latest_metrics()
             levels = self._perf_monitor.get_latest_levels()
 
         # 更新已知交换机集合
         switches = graph.get("switches", {})
-        for dpid_str, sw_info in switches.items():
+        for _dpid_str, sw_info in switches.items():
             dp = sw_info.get("dpid", 0)
             if dp:
                 self._known_dpids.add(dp)
@@ -184,7 +184,7 @@ class RouteManager(Stalker):
                 # 实际使用中应该根据业务类型选择对应 profile
                 # 这里为每个 (src,dst) 预计算所有 profile 的路由
                 key = (src, dst)
-                entry = {"profiles": {}}
+                entry: Dict[str, Any] = {"profiles": {}}
 
                 for profile in self.P0_PROFILES | self.P1_PROFILES:
                     result = self._calculator.compute(
@@ -212,7 +212,7 @@ class RouteManager(Stalker):
         self._total_recomputes += 1
         self._last_recompute_time = elapsed
 
-        summary = {
+        summary: Dict[str, Any] = {
             "routes": len(new_cache),
             "switches": len(dpids),
             "p0_primary": p0_count,
@@ -253,8 +253,8 @@ class RouteManager(Stalker):
             return None
 
         graph = self._topology_graph.get_full()
-        metrics = self._perf_monitor.get_latest_metrics() if self._perf_monitor else {}
-        levels = self._perf_monitor.get_latest_levels() if self._perf_monitor else {}
+        metrics: Dict[Tuple[int, int, int, int], Any] = self._perf_monitor.get_latest_metrics() if self._perf_monitor else {}
+        levels: Dict[Tuple[int, int, int, int], int] = self._perf_monitor.get_latest_levels() if self._perf_monitor else {}
 
         return self._calculator.compute(
             graph=graph,
@@ -300,7 +300,7 @@ class RouteManager(Stalker):
     #  统计
     # ──────────────────────────────────────────────
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         with self._cache_lock:
             cache_size = len(self._route_cache)
         return {

@@ -15,9 +15,9 @@ LLDP 采集器 — 定期生成 LLDP 包并通过 PacketOut 下发给交换机
 
 import time
 import threading
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .lldp_utils import dpid_to_mac, build_lldp_frame, DEFAULT_TTL
+from .lldp_utils import dpid_to_mac, build_lldp_frame, DEFAULT_TTL  # type: ignore[reportUnknownVariableType]
 
 
 class SwitchHandle:
@@ -30,7 +30,7 @@ class SwitchHandle:
     此处建立“下行队列”模式。
     """
 
-    def __init__(self, dpid: int, datapath):
+    def __init__(self, dpid: int, datapath: Any):
         self.dpid = dpid
         self.datapath = datapath
         self.ports: List[int] = []  # 已知端口号列表
@@ -52,15 +52,15 @@ class LLDPCollector:
     """
 
     # LLDP 发送间隔（秒）
-    LLDP_INTERVAL = 5.0
+    LLDP_INTERVAL = 2.0
 
-    def __init__(self, logger=None):
-        self.logger = logger
+    def __init__(self, logger: Any = None):
+        self.logger: Any = logger
         self._switches: Dict[int, SwitchHandle] = {}
         self._lock = threading.Lock()
 
         # 下行队列：主控线程消费此队列并实际 send_msg
-        self.downlink_queue: List = []  # list of (datapath, ofp_msg)
+        self.downlink_queue: List[Tuple[Any, Any]] = []  # list of (datapath, ofp_msg)
 
         # LLDP 发送回调（注入 PerformanceMonitor.on_lldp_sent）
         # 每次构造 LLDP 帧时调用，传入 (dpid, port_no) 供性能检测记录时间戳
@@ -71,7 +71,7 @@ class LLDPCollector:
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
-    def register_switch(self, dpid: int, datapath):
+    def register_switch(self, dpid: int, datapath: Any):
         """注册交换机（由 app.py 在 switch_features_handler 中调用）"""
         with self._lock:
             self._switches[dpid] = SwitchHandle(dpid, datapath) 
@@ -91,6 +91,17 @@ class LLDPCollector:
         with self._lock:
             if dpid in self._switches:
                 self._switches[dpid].ports = list(ports)
+
+    def remove_port(self, dpid: int, port_no: int):
+        """从交换机端口列表中移除一个端口（端口 DOWN 时调用）"""
+        with self._lock:
+            sw = self._switches.get(dpid)
+            if sw and port_no in sw.ports:
+                sw.ports.remove(port_no)
+                if self.logger:
+                    self.logger.info(
+                        f"[LLDPCollector] Removed port {port_no} from switch {dpid:016x}"
+                    )
 
     def get_chassis_macs(self) -> List[bytes]:
         """获取所有已注册交换机的 Chassis MAC 列表（供 validator 使用）"""
@@ -175,7 +186,7 @@ class LLDPCollector:
             if self.on_lldp_sent_callback:
                 self.on_lldp_sent_callback(sw.dpid, port_no)
 
-    def drain_downlink(self) -> List:
+    def drain_downlink(self) -> List[Tuple[Any, Any]]:
         """
         取出并清空下行队列（由 app.py 主线程调用）
 
@@ -187,7 +198,7 @@ class LLDPCollector:
             self.downlink_queue.clear()
         return items
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         with self._lock:
             switch_count = len(self._switches)
         return {

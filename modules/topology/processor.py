@@ -37,11 +37,15 @@ import time
 import json
 import uuid
 import threading
-from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from .lldp_utils import parse_lldp_frame, dpid_to_mac
 from .validator import LLDPValidator
+
+if TYPE_CHECKING:
+    from storage.redis_client import RedisClient
+    from storage.mysql_client import MySQLWriterThread
+    from modules.stalker.stalker_manager import StalkerManager
 
 
 # ── 链路变更事件 ───────────────────────────────────
@@ -50,7 +54,6 @@ class LinkEvent:
     """单条链路变更事件"""
     ADD = "ADD"
     DELETE = "DELETE"
-    MODIFY = "MODIFY"
 
     def __init__(self, event_type: str, src_dpid: int, src_port: int,
                  dst_dpid: int, dst_port: int, timestamp: Optional[float] = None):
@@ -65,7 +68,7 @@ class LinkEvent:
     def link_key(self):
         return (self.src_dpid, self.src_port, self.dst_dpid, self.dst_port)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "type": self.event_type,
             "src_dpid": f"{self.src_dpid:016x}",
@@ -88,14 +91,14 @@ class TopologyGraph:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._graph: dict = {
+        self._graph: Dict[str, Any] = {
             "switches": {},
             "links": {},
             "version": 0,
             "updated_at": 0.0,
         }
 
-    def get_full(self) -> dict:
+    def get_full(self) -> Dict[str, Any]:
         """获取完整拓扑图谱（深拷贝）"""
         import copy
         with self._lock:
@@ -117,19 +120,27 @@ class TopologyGraph:
                 self._graph["version"] += 1
                 self._graph["updated_at"] = time.time()
 
-    def remove_switch(self, dpid: int):
+    def remove_switch(self, dpid: int) -> List[Tuple[int, int, int, int]]:
+        """
+        移除交换机及其所有关联链路。
+
+        Returns:
+            被删除的链路 key 列表 [(src_dpid, src_port, dst_dpid, dst_port), ...]
+        """
         with self._lock:
             key = str(dpid)
             self._graph["switches"].pop(key, None)
             # 删除涉及该交换机的所有链路
-            to_remove = []
-            for lk in self._graph["links"]:
+            to_remove: List[Tuple[int, int, int, int]] = []
+            for lk in list(self._graph["links"].keys()):
                 if lk[0] == dpid or lk[2] == dpid:
                     to_remove.append(lk)
             for lk in to_remove:
                 del self._graph["links"][lk]
-            self._graph["version"] += 1
-            self._graph["updated_at"] = time.time()
+            if to_remove:
+                self._graph["version"] += 1
+                self._graph["updated_at"] = time.time()
+            return to_remove
 
     def upsert_link(self, src_dpid: int, src_port: int,
                     dst_dpid: int, dst_port: int) -> Optional[LinkEvent]:
@@ -175,7 +186,7 @@ class TopologyGraph:
             LinkEvent(DELETE) 列表
         """
         now = time.time()
-        events = []
+        events: List[LinkEvent] = []
         with self._lock:
             for key, link in list(self._graph["links"].items()):
                 if link["status"] == "UP" and (now - link["last_seen"]) > timeout:
@@ -186,6 +197,29 @@ class TopologyGraph:
                 self._graph["updated_at"] = now
         return events
 
+    def remove_links_by_port(self, dpid: int, port: int) -> List[Tuple[int, int, int, int]]:  # type: ignore[reportUnknownVariableType]
+        """
+        移除涉及指定 (dpid, port) 的所有链路（端口 DOWN 专用）。
+
+        Args:
+            dpid: 交换机 DPID
+            port: 端口号
+
+        Returns:
+            被删除的链路 key 列表
+        """
+        to_remove: List[Tuple[int, int, int, int]] = []
+        with self._lock:
+            for lk in list(self._graph["links"].keys()):
+                if (lk[0] == dpid and lk[1] == port) or (lk[2] == dpid and lk[3] == port):
+                    to_remove.append(lk)
+            for lk in to_remove:
+                del self._graph["links"][lk]
+            if to_remove:
+                self._graph["version"] += 1
+                self._graph["updated_at"] = time.time()
+        return to_remove
+
     def get_switch_count(self) -> int:
         with self._lock:
             return len(self._graph["switches"])
@@ -194,7 +228,7 @@ class TopologyGraph:
         with self._lock:
             return sum(1 for l in self._graph["links"].values() if l["status"] == "UP")
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> Dict[str, Any]:
         """获取可 JSON 序列化的图谱（tuple key → str key）"""
         full = self.get_full()
         links_str = {}
@@ -226,7 +260,7 @@ class DebounceWindow:
     def __init__(self, base_window: float = 2.0, max_window: float = 5.0):
         self.base_window = base_window
         self.max_window = max_window
-        self._events: Dict[tuple, LinkEvent] = {}
+        self._events: Dict[Tuple[int, int, int, int], LinkEvent] = {} #用字典存储事件，相同key的事件会被覆盖，实现合并效果，只关心最新状态
         self._first_event_time: Optional[float] = None
         self._lock = threading.Lock()
 
@@ -242,9 +276,11 @@ class DebounceWindow:
         """判断是否应该触发 flush"""
         if not self._events:
             return False
+        #没有事件时不需要 flush
         with self._lock:
             if self._first_event_time is None:
                 return False
+            #没有第一件事件的时间时不需要 flush，防御性检查
             elapsed = time.time() - self._first_event_time
             # 到达 max_window 上限 → 强制 flush
             if elapsed >= self.max_window:
@@ -261,60 +297,8 @@ class DebounceWindow:
             self._first_event_time = None
         return events
 
-    def is_empty(self) -> bool:
-        with self._lock:
-            return len(self._events) == 0
-
     def __repr__(self):
         return f"DebounceWindow(events={len(self._events)}, base={self.base_window}s, max={self.max_window}s)"
-
-
-# ── Diff Engine ────────────────────────────────────
-
-class DiffEngine:
-    """
-    增量 Diff 计算引擎
-
-    比较窗口变更事件 vs 当前拓扑图谱，计算增量变更集。
-    这是为未来接入 Redis 预留的接口（当前 Phase 2 直接维护内存拓扑图）。
-    """
-
-    @staticmethod
-    def compute(events: List[LinkEvent], current_graph: dict) -> dict:
-        """
-        计算增量变更集
-
-        Args:
-            events: 窗口收集的变更事件列表
-            current_graph: 当前拓扑图谱快照
-
-        Returns:
-            {
-                "added": [link_dict, ...],
-                "removed": [link_dict, ...],
-                "modified": [link_dict, ...],
-                "version": int,
-            }
-        """
-        added = []
-        removed = []
-        modified = []
-
-        for event in events:
-            d = event.to_dict()
-            if event.event_type == LinkEvent.ADD:
-                added.append(d)
-            elif event.event_type == LinkEvent.DELETE:
-                removed.append(d)
-            elif event.event_type == LinkEvent.MODIFY:
-                modified.append(d)
-
-        return {
-            "added": added,
-            "removed": removed,
-            "modified": modified,
-            "version": current_graph.get("version", 0) + 1,
-        }
 
 
 # ── 拓扑处理器（主类） ─────────────────────────────
@@ -332,17 +316,19 @@ class TopologyProcessor:
       event = processor.process_structured_message(msg)
     """
 
-    # LLDP 超时时间（秒）— 连续 3 次未收到（每次间隔 30s）= 90s
-    LINK_TIMEOUT = 90.0
+    # LLDP 超时时间（秒）— 连续 3 次未收到 = 3 × LLDP_INTERVAL
+    LINK_TIMEOUT = 6.0
 
-    # 超时扫描间隔
-    TIMEOUT_SCAN_INTERVAL = 10.0
+    # 超时扫描间隔（对齐 LLDP 下发周期）
+    TIMEOUT_SCAN_INTERVAL = 2.0
 
-    def __init__(self, logger=None, redis_client=None, mysql_writer=None):
-        self.logger = logger
-        self._redis = redis_client               # Phase 3: Redis 客户端引用（可延迟注入）
-        self._mysql_writer = mysql_writer        # Phase 3: MySQL 异步写入器引用（可延迟注入）
-        self._stalker_manager = None             # Phase 3: 盯梢者管理器引用
+    def __init__(self, logger: Any = None,
+                 redis_client: "Optional[RedisClient]" = None,
+                 mysql_writer: "Optional[MySQLWriterThread]" = None):
+        self.logger: Any = logger
+        self._redis: "Optional[RedisClient]" = redis_client
+        self._mysql_writer: "Optional[MySQLWriterThread]" = mysql_writer
+        self._stalker_manager: "Optional[StalkerManager]" = None
         self.graph = TopologyGraph()
         self.validator = LLDPValidator()
         self.debounce = DebounceWindow(base_window=2.0, max_window=5.0)
@@ -362,21 +348,59 @@ class TopologyProcessor:
         self._event_lock = threading.Lock()
         self._event_available = threading.Condition(self._event_lock)
 
-    def set_redis(self, redis_client):
+        # 命令队列（主线程只透传命令 → TopologyProcessor 线程执行全部业务逻辑）
+        self._commands: List[Dict[str, Any]] = []
+        self._commands_lock = threading.Lock()
+
+        # 黑名单：前两道防线已判定断开 → 拒绝管道中的旧 LLDP 复活
+        #   _deleted_switches: OF 事件已确认断开的交换机 DPID 集合
+        #   _deleted_ports:     OF 事件已确认 DOWN 的 (dpid, port) 集合
+        # process_structured_message() 在第一道关口检查并丢弃匹配的旧 LLDP
+        self._deleted_switches: Set[int] = set()
+        self._deleted_ports: Set[Tuple[int, int]] = set()
+        self._blacklist_lock = threading.Lock()
+
+    def set_redis(self, redis_client: "RedisClient") -> None:
         """Phase 3: 延迟注入 Redis 客户端"""
         self._redis = redis_client
 
-    def set_stalker_manager(self, stalker_manager):
+    def set_stalker_manager(self, stalker_manager: "StalkerManager") -> None:
         """Phase 3: 注入盯梢者管理器（进程内直接通知）"""
         self._stalker_manager = stalker_manager
 
-    def set_mysql_writer(self, mysql_writer):
+    def set_mysql_writer(self, mysql_writer: "MySQLWriterThread") -> None:
         """Phase 3: 注入 MySQL 异步写入器（fire-and-forget）"""
         self._mysql_writer = mysql_writer
 
+    # ── 交换机断开处理 ───────────────────────────────
+
+    def handle_switch_disconnected(self, dpid: int):
+        """透传命令：主线程不做任何拓扑操作，仅入队命令。
+        
+        所有拓扑图修改 + Redis/MySQL/Stalker 通知由 TopologyProcessor 线程执行。
+        """
+        self._enqueue_command({"cmd": "switch_down", "dpid": dpid})
+
+    def handle_port_down(self, dpid: int, port: int):
+        """透传命令：主线程不做任何拓扑操作，仅入队命令。
+        
+        所有拓扑图修改 + Redis/MySQL/Stalker 通知由 TopologyProcessor 线程执行。
+        """
+        self._enqueue_command({"cmd": "port_down", "dpid": dpid, "port": port})
+
+    def clear_blacklist_switch(self, dpid: int):
+        """交换机重连时清除黑名单，恢复 LLDP 处理"""
+        with self._blacklist_lock:
+            self._deleted_switches.discard(dpid)
+
+    def clear_blacklist_port(self, dpid: int, port: int):
+        """端口恢复时清除黑名单，恢复该端口 LLDP 处理"""
+        with self._blacklist_lock:
+            self._deleted_ports.discard((dpid, port))
+
     # ── Phase 3: Redis 写入（极简：全量快照 + 版本号） ──
 
-    def _write_to_redis(self, events):
+    def _write_to_redis(self, events: List[LinkEvent]) -> None:
         """
         每次 flush 时写入 Redis：
           SET  topology:graph:current  — JSON 全量快照
@@ -387,22 +411,22 @@ class TopologyProcessor:
             return
 
         client = self._redis.client
-        pipe = client.pipeline()
-        pipe.set('topology:graph:current', json.dumps(self.graph.to_dict()))
-        pipe.incr('topology:graph:version')
-        pipe.execute()
+        pipe = client.pipeline()  # type: ignore[reportUnknownMemberType]
+        pipe.set('topology:graph:current', json.dumps(self.graph.to_dict())) #写入快照
+        pipe.incr('topology:graph:version') #版本号自增，供盯梢者检测变更使用
+        pipe.execute() #执行 Redis 命令
 
         # 进程内唤醒盯梢者（零网络、零轮询）
         self._notify_stalkers(events)
 
-    def _notify_stalkers(self, events):
+    def _notify_stalkers(self, events: List[LinkEvent]) -> None:
         """进程内直接调用 StalkerManager（零 Redis 中间层）"""
         if self._stalker_manager is not None:
             self._stalker_manager.notify(events)
 
     # ── Phase 3: MySQL 异步写入（fire-and-forget） ──
 
-    def _enqueue_mysql(self, events):
+    def _enqueue_mysql(self, events: List[LinkEvent]) -> None:
         """放入 MySQL 后台写入队列后立即返回（~μs 级）
 
         调用方（_apply_events）不会被 MySQL 阻塞：
@@ -417,7 +441,7 @@ class TopologyProcessor:
 
         graph_version = self.graph.get_version()
         for e in events:
-            row = {
+            row: Dict[str, Any] = {
                 'change_id': uuid.uuid4().hex,
                 'operation': e.event_type,
                 'src_device': f"{e.src_dpid:016x}",
@@ -426,7 +450,90 @@ class TopologyProcessor:
                 'dst_port': str(e.dst_port),
                 'topology_version': graph_version,
             }
-            self._mysql_writer.enqueue(row)
+            self._mysql_writer.enqueue(row) #这个函数作用是将 row 放入 MySQLWriterThread 的队列中，MySQLWriterThread 会在后台线程中定期批量写入 MySQL 数据库，实现异步写入，调用这个函数后立即返回，不会阻塞当前线程。
+
+    # ── 命令透传（主线程仅入队，TopologyProcessor 线程执行业务） ──
+
+    def _enqueue_command(self, cmd: Dict[str, Any]) -> None:
+        """主线程唯一调用入口：只做 dict append（~ns 级），零业务逻辑。"""
+        with self._commands_lock:
+            self._commands.append(cmd)
+
+    def _drain_commands(self):
+        """在 TopologyProcessor 线程中排空命令队列并逐条执行"""
+        with self._commands_lock:
+            if not self._commands:
+                return
+            commands = self._commands[:]
+            self._commands.clear()
+
+        for cmd in commands:
+            try:
+                self._execute_command(cmd)
+            except Exception:
+                if self.logger:
+                    self.logger.exception(
+                        f"[TopologyProcessor] Failed to execute command: {cmd}"
+                    )
+
+    def _execute_command(self, cmd: Dict[str, Any]) -> None:
+        """在 TopologyProcessor 线程中执行命令（拓扑图修改 + 事件生成 + 下游通知）"""
+        cmd_type = cmd["cmd"]
+
+        if cmd_type == "switch_down":
+            dpid = cmd["dpid"]
+            removed_links = self.graph.remove_switch(dpid)
+
+            # 加入黑名单：管道中残留的旧 LLDP 不得复活已删除的交换机
+            with self._blacklist_lock:
+                self._deleted_switches.add(dpid)
+
+            if not removed_links:
+                if self.logger:
+                    self.logger.info(
+                        f"[Topology] Switch {dpid:016x} disconnected (no links to remove)"
+                    )
+                return
+
+            now = time.time()
+            events = [
+                LinkEvent(LinkEvent.DELETE, *lk, timestamp=now)
+                for lk in removed_links
+            ]
+            self._apply_events(events)
+
+            if self.logger:
+                self.logger.info(
+                    f"[Topology] Switch {dpid:016x} disconnected — "
+                    f"removed {len(removed_links)} links"
+                )
+
+        elif cmd_type == "port_down":
+            dpid = cmd["dpid"]
+            port = cmd["port"]
+            removed_links = self.graph.remove_links_by_port(dpid, port)
+
+            # 加入黑名单：管道中残留的旧 LLDP 不得复活已删除的端口链路
+            with self._blacklist_lock:
+                self._deleted_ports.add((dpid, port))
+
+            if not removed_links:
+                return
+
+            now = time.time()
+            events = [
+                LinkEvent(LinkEvent.DELETE, *lk, timestamp=now)
+                for lk in removed_links
+            ]
+            self._apply_events(events)
+
+            if self.logger:
+                self.logger.warning(
+                    f"[Topology] Port {dpid:016x}:{port} DOWN — "
+                    f"removed {len(removed_links)} links"
+                )
+
+    # ── 启动 / 停止 ──────────────────────────────────
 
     def start(self):
         """启动拓扑处理器线程（防抖 flush + 超时扫描）"""
@@ -450,7 +557,7 @@ class TopologyProcessor:
             self.logger.info("[TopologyProcessor] Stopped")
 
     def _run_loop(self):
-        """主循环：周期性检查防抖窗口 + 超时链表"""
+        """主循环：防抖 flush + 超时扫描 + 排空延迟队列（Redis/Stalker）"""
         last_timeout_scan = time.time()
         while self._running:
             try:
@@ -468,6 +575,9 @@ class TopologyProcessor:
                         self._apply_events(stale_events)
                     last_timeout_scan = now
 
+                # 3. 排空命令队列（主线程透传的 switch_down / port_down）
+                self._drain_commands()
+
             except Exception:
                 if self.logger:
                     self.logger.exception("[TopologyProcessor] Error in run loop")
@@ -478,7 +588,10 @@ class TopologyProcessor:
         """应用变更事件到图谱，并推送到待处理队列"""
         with self._event_lock:
             for event in events:
-                self._pending_events.append(event)
+                self._pending_events.append(event) 
+                #其实可以不用这个队列，lldp到这里使命已经完成，外部模块调用采用的是键空间通知的方式，
+                # 事件内容直接放在 Redis 里，外部模块拿到通知后再去 Redis 取最新的图谱数据，
+                # 这样就不需要在内存里维护一个待处理事件队列了
             self._event_available.notify_all()
 
         self._total_events_emitted += len(events)
@@ -497,7 +610,7 @@ class TopologyProcessor:
                     f"{e.dst_dpid:016x}:{e.dst_port}"
                 )
 
-    def process_structured_message(self, structured_msg) -> Optional[LinkEvent]:
+    def process_structured_message(self, structured_msg: Any) -> Optional[LinkEvent]:
         """
         处理来自 east_queue 的 StructuredMessage
 
@@ -548,47 +661,39 @@ class TopologyProcessor:
             self._total_lldp_invalid += 1
             return None
 
-        # 4. 注册交换机到 validator
+        # 4. 黑名单检查：拒绝前两道防线已判定断开的交换机/端口的旧 LLDP
+        # 优先级：EventOFPStateChange / EventOFPPortStatus（百分百准确）> LLDP（慢且不可靠）
+        with self._blacklist_lock:
+            if src_dpid in self._deleted_switches or dst_dpid in self._deleted_switches:
+                # 管道中残留的旧 LLDP → 丢弃，防止复活已删除的交换机
+                return None
+            if (src_dpid, src_port) in self._deleted_ports:
+                return None
+            if (dst_dpid, dst_port) in self._deleted_ports:
+                return None
+
+        # 5. 注册交换机到 validator
         self.validator.register_device(lldp_packet.chassis_mac)
 
-        # 5. 添加交换机到拓扑图谱（如果尚未存在）
+        # 6. 添加交换机到拓扑图谱（如果尚未存在）
         self.graph.add_switch(src_dpid)
         self.graph.add_switch(dst_dpid, mac=lldp_packet.chassis_mac)
 
-        # 6. 更新链路信息（双向记录）
+        # 7. 更新链路信息（双向记录）
         # 收到 LLDP 意味着 src_dpid:src_port ← dst_dpid:dst_port
         event = self.graph.upsert_link(dst_dpid, dst_port, src_dpid, src_port)
 
-        # 7. 放入防抖窗口
+        # 8. 放入防抖窗口
         if event:
             self.debounce.add(event)
 
         return event
 
-    def poll_events(self, timeout: Optional[float] = None) -> List[LinkEvent]:
-        """
-        轮询待处理的拓扑变更事件（阻塞）
-
-        供外部（如北向 API、盯梢者）消费拓扑变更通知。
-
-        Args:
-            timeout: 阻塞超时（秒），None 表示永久阻塞
-
-        Returns:
-            LinkEvent 列表
-        """
-        with self._event_lock:
-            if not self._pending_events and timeout is not None:
-                self._event_available.wait(timeout)
-            events = self._pending_events[:]
-            self._pending_events.clear()
-        return events
-
-    def get_topology(self) -> dict:
+    def get_topology(self) -> Dict[str, Any]:
         """获取当前拓扑图谱（JSON 可序列化）"""
         return self.graph.to_dict()
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         # Phase 3: Redis 连接状态
         _redis_ok = False
         if self._redis is not None:

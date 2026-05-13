@@ -16,17 +16,20 @@ StalkerManager — 盯梢者统一管理器（进程内通知模式 v2）
 """
 
 import logging
+from typing import Any, List, Tuple
+
+from .stalker_base import Stalker
 
 
 class StalkerManager:
     """盯梢者管理器 — 级联唤醒，防止惊群"""
 
-    def __init__(self, logger=None):
-        self.logger = logger or logging.getLogger(__name__)
-        self._registry: list = []  # [(wake_order, stalker), ...]
+    def __init__(self, logger: Any = None):
+        self.logger: Any = logger or logging.getLogger(__name__)
+        self._registry: List[Tuple[int, Stalker]] = []
         self._enabled = True
 
-    def register(self, stalker, wake_order: int = 0):
+    def register(self, stalker: Stalker, wake_order: int = 0) -> None:
         """
         注册一个盯梢者。
 
@@ -34,15 +37,15 @@ class StalkerManager:
             stalker: Stalker 子类实例
             wake_order: 唤醒顺序，数字越小越先被调用
         """
-        self._registry.append((wake_order, stalker))
-        self._registry.sort(key=lambda x: x[0])
+        self._registry.append((wake_order, stalker)) #添加到注册表
+        self._registry.sort(key=lambda x: x[0]) #按 wake_order 排序，确保 notify() 时按顺序调用
         if self.logger:
             self.logger.info(
                 "[StalkerManager] Registered %s (order=%d)",
                 type(stalker).__name__, wake_order,
             )
 
-    def notify(self, events: list):
+    def notify(self, events: List[Any]) -> None:
         """
         进程内通知所有盯梢者（由 processor._notify_stalkers 调用）。
 
@@ -53,7 +56,7 @@ class StalkerManager:
 
         for order, stalker in self._registry:
             try:
-                stalker.on_events(events)
+                stalker.on_events(events) #调用每个注册的盯梢者实例的 on_events() 方法，传入事件列表
             except Exception:
                 if self.logger:
                     self.logger.exception(
@@ -61,18 +64,3 @@ class StalkerManager:
                         type(stalker).__name__, order,
                     )
 
-    def stop(self):
-        """停用通知（保留注册表，可恢复）"""
-        self._enabled = False
-        if self.logger:
-            self.logger.info("[StalkerManager] Stopped")
-
-    def stats(self) -> dict:
-        return {
-            "enabled": self._enabled,
-            "registered": len(self._registry),
-            "stalkers": [
-                {"name": type(s).__name__, "order": o}
-                for o, s in self._registry
-            ],
-        }

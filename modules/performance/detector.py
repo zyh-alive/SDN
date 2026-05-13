@@ -27,7 +27,7 @@ EWMA 算法（架构方案 §5）：
 
 import time
 from collections import deque
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .metrics import LinkMetrics
 
@@ -65,14 +65,14 @@ class EWMADetector:
         self.history_size = history_size
 
         # 每条链路的 EWMA 基线 (throughput, delay, jitter, loss)
-        self._baselines: Dict[Tuple, Tuple[float, float, float, float]] = {}
+        self._baselines: Dict[Tuple[int, int, int, int], Tuple[float, float, float, float]] = {}
 
         # 每条链路的历史值（用于计算标准差）
-        self._delay_history: Dict[Tuple, deque] = {}
-        self._loss_history: Dict[Tuple, deque] = {}
+        self._delay_history: Dict[Tuple[int, int, int, int], "deque[float]"] = {}
+        self._loss_history: Dict[Tuple[int, int, int, int], "deque[float]"] = {}
 
         # 当前拥堵等级
-        self._levels: Dict[Tuple, int] = {}
+        self._levels: Dict[Tuple[int, int, int, int], int] = {}
 
         # 统计
         self._total_evaluations = 0
@@ -162,7 +162,7 @@ class EWMADetector:
 
         return level
 
-    def _compute_std(self, history: Optional[deque]) -> float:
+    def _compute_std(self, history: Optional["deque[float]"]) -> float:
         """计算历史值的标准差"""
         if not history or len(history) < 2:
             return 1.0  # 默认标准差（无历史数据时保守返回 1.0）
@@ -173,26 +173,14 @@ class EWMADetector:
         variance = sum((x - mean) ** 2 for x in history) / (n - 1)
         return math.sqrt(variance)
 
-    def get_level(self, link_id: Tuple) -> int:
-        """获取链路当前拥堵等级"""
-        return self._levels.get(link_id, self.LEVEL_NORMAL)
-
-    def get_baseline(self, link_id: Tuple) -> Optional[Tuple[float, float, float, float]]:
-        """获取链路 EWMA 基线"""
-        return self._baselines.get(link_id)
-
-    def reset_link(self, link_id: Tuple):
+    def reset_link(self, link_id: Tuple[int, int, int, int]):
         """重置链路状态"""
         self._baselines.pop(link_id, None)
         self._delay_history.pop(link_id, None)
         self._loss_history.pop(link_id, None)
         self._levels.pop(link_id, None)
 
-    @classmethod
-    def level_name(cls, level: int) -> str:
-        return cls.LEVEL_NAMES.get(level, f"UNKNOWN({level})")
-
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, int]:
         return {
             "total_evaluations": self._total_evaluations,
             "active_links": len(self._baselines),

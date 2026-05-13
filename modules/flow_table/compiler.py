@@ -22,11 +22,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ── 优先级常量 ──
-PRIORITY_DEFAULT = 0       # 默认流表（全部上送控制器）
 PRIORITY_BACKUP = 50       # P0 备路径
 PRIORITY_PRIMARY = 100     # 主路径（P0/P1）
 PRIORITY_ARP = 150         # ARP 处理规则
-PRIORITY_CRITICAL = 200    # 关键控制流量
 
 
 @dataclass
@@ -49,13 +47,13 @@ class FlowRule:
     rule_id: str
     dpid: int
     priority: int
-    match_fields: Dict[str, Any] = field(default_factory=dict)
-    actions: List[Dict[str, Any]] = field(default_factory=list)
+    match_fields: Dict[str, Any] = field(default_factory=dict[str, Any])
+    actions: List[Dict[str, Any]] = field(default_factory=list[Dict[str, Any]])
     table_id: int = 0
     idle_timeout: int = 0
     hard_timeout: int = 0
     cookie: int = 0
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict[str, Any])
 
     def __repr__(self):
         return (f"FlowRule(id={self.rule_id}, dpid={self.dpid}, "
@@ -66,9 +64,9 @@ class FlowRule:
 #  路径 → 流表规则 编译
 # ──────────────────────────────────────────────
 
-def compile_path_rules(
+def compile_path_rules(  # type: ignore[reportUnknownParameterType]
     path: List[int],
-    graph: dict,
+    graph: Dict[str, Any],
     src_dpid: int,
     dst_dpid: int,
     src_mac: Optional[str] = None,
@@ -116,8 +114,8 @@ def compile_path_rules(
     links = graph.get("links", {})
 
     # 辅助：构建匹配字段（共享逻辑）
-    def _build_match(in_port: Optional[int]) -> dict:
-        m = {}
+    def _build_match(in_port: Optional[int]) -> Dict[str, Any]:
+        m: Dict[str, Any] = {}
         if in_port is not None:
             m["in_port"] = in_port
         if src_mac:
@@ -132,7 +130,6 @@ def compile_path_rules(
         #   - udp_src / udp_dst 要求 ip_proto = 17 (UDP)
         #   缺少 eth_type 会导致 ovs 返回 OFPET_BAD_MATCH(4) + OFPBMC_BAD_PREREQ(9)
         has_l3 = bool(src_ip or dst_ip or ip_proto is not None)
-        has_l4 = bool(src_port is not None or dst_port is not None)
 
         if has_l3:
             m["eth_type"] = 0x0800  # IPv4
@@ -166,7 +163,7 @@ def compile_path_rules(
             in_port = _find_in_port(links, prev_dpid, sw_dpid)
 
         match = _build_match(in_port)
-        actions = [{"type": "OUTPUT", "port": out_port}]
+        actions: List[Dict[str, Any]] = [{"type": "OUTPUT", "port": out_port}]
 
         rule = FlowRule(
             rule_id=f"{rule_prefix}_{src_dpid}_{dst_dpid}_hop{i}",
@@ -192,7 +189,7 @@ def compile_path_rules(
             last_in_port = first_hop_in_port
 
         last_match = _build_match(last_in_port)
-        last_actions = [{"type": "OUTPUT", "port": dst_host_port}]
+        last_actions: List[Dict[str, Any]] = [{"type": "OUTPUT", "port": dst_host_port}]
 
         last_rule = FlowRule(
             rule_id=f"{rule_prefix}_{src_dpid}_{dst_dpid}_hop{len(path)-1}",
@@ -208,10 +205,10 @@ def compile_path_rules(
     return rules
 
 
-def compile_p0_rules(
+def compile_p0_rules(  # type: ignore[reportUnknownParameterType]
     primary_path: List[int],
     backup_path: List[int],
-    graph: dict,
+    graph: Dict[str, Any],
     src_dpid: int,
     dst_dpid: int,
     **match_kwargs,
@@ -243,9 +240,9 @@ def compile_p0_rules(
     return primary_rules, backup_rules
 
 
-def compile_p1_rules(
+def compile_p1_rules(  # type: ignore[reportUnknownParameterType]
     primary_path: List[int],
-    graph: dict,
+    graph: Dict[str, Any],
     src_dpid: int,
     dst_dpid: int,
     **match_kwargs,
@@ -274,8 +271,8 @@ def compile_p1_rules(
 #  辅助
 # ──────────────────────────────────────────────
 
-def _find_out_port(
-    links: dict, src_dpid: int, dst_dpid: int
+def _find_out_port(  # type: ignore[reportUnknownParameterType]
+    links: Dict[str, Any], src_dpid: int, dst_dpid: int
 ) -> Optional[int]:
     """在拓扑链路表中查找 src→dst 的出端口号。"""
     for key, link_info in links.items():
@@ -289,8 +286,8 @@ def _find_out_port(
     return None
 
 
-def _find_in_port(
-    links: dict, src_dpid: int, dst_dpid: int
+def _find_in_port(  # type: ignore[reportUnknownParameterType]
+    links: Dict[str, Any], src_dpid: int, dst_dpid: int
 ) -> Optional[int]:
     """在拓扑链路表中查找 src→dst 的入端口号（dst 侧端口）。"""
     for key, link_info in links.items():
@@ -314,7 +311,7 @@ if __name__ == "__main__":
     errors: List[str] = []
 
     # 测试拓扑
-    test_graph = {
+    test_graph: Dict[str, Any] = {
         "switches": {},
         "links": {
             (1, 1, 2, 1): {"src_dpid": 1, "dst_dpid": 2, "src_port": 1, "dst_port": 1},

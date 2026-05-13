@@ -17,7 +17,7 @@ Hash Dispatcher（多线程分发器）
 import queue
 import struct
 import threading
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from modules.message_queue.ring_buffer import RingBuffer
 from modules.message_queue.worker import Worker
@@ -60,7 +60,7 @@ class Dispatcher:
         self._total_dispatched_west = 0
 
     @property
-    def workers(self) -> list:
+    def workers(self) -> List[Worker]:
         return self._workers
 
     # ──────────────────────────────────────────────
@@ -69,7 +69,7 @@ class Dispatcher:
 
     def start(self):
         """启动 Dispatcher 线程 + 所有 Worker 线程"""
-        if self._running:
+        if self._running: # 避免重复启动
             return
         self._running = True
 
@@ -83,18 +83,6 @@ class Dispatcher:
         )
         self._thread.start()
 
-    def stop(self):
-        """停止 Dispatcher + 所有 Worker 线程"""
-        self._running = False
-
-        # 停止 Dispatcher 线程
-        if self._thread:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-
-        # 停止所有 Worker 线程
-        for worker in self._workers:
-            worker.stop()
 
     # ──────────────────────────────────────────────
     # Dispatcher 主循环
@@ -113,20 +101,7 @@ class Dispatcher:
                 continue
             self._dispatch_to_worker(msg, via_east=True)
 
-    # ──────────────────────────────────────────────
-    # 分发逻辑
-    # ──────────────────────────────────────────────
-
-    def dispatch(self, msg) -> None:
-        """
-        西向快通道：主控直接调用，跳过 Ring Buffer
-
-        Args:
-            msg: Ryu PacketIn 消息对象 (ev.msg)
-        """
-        self._dispatch_to_worker(msg, via_east=False)
-
-    def _dispatch_to_worker(self, msg, via_east: bool):
+    def _dispatch_to_worker(self, msg: Any, via_east: bool):
         """
         将消息非阻塞推送到固定 Worker 的 input_queue
 
@@ -152,12 +127,12 @@ class Dispatcher:
         except queue.Full:
             # Worker 输入队列满：丢弃最旧消息后重试
             try:
-                worker.input_queue.get_nowait()
-                worker.input_queue.put_nowait(msg)
+                worker.input_queue.get_nowait()  # 丢弃最旧消息
+                worker.input_queue.put_nowait(msg)  # 重试放入新消息
             except queue.Empty:
                 pass
 
-        if via_east:
+        if via_east:  #
             self._total_dispatched_east += 1
         else:
             self._total_dispatched_west += 1
@@ -166,27 +141,7 @@ class Dispatcher:
     # 静态工具
     # ──────────────────────────────────────────────
 
-    @staticmethod
-    def parse_ethertype(data: bytes) -> int:
-        """
-        浅解析：从以太网帧头提取 EtherType
-
-        以太网帧头结构（14 字节）:
-        - dst_mac: 6 bytes
-        - src_mac: 6 bytes
-        - ethertype: 2 bytes
-
-        Args:
-            data: 完整数据包字节
-
-        Returns:
-            EtherType 值，无效时返回 0
-        """
-        if len(data) < 14:
-            return 0
-        return struct.unpack("!H", data[12:14])[0]
-
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         worker_stats = [w.stats() for w in self._workers]
         return {
             "dispatcher": {

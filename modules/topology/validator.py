@@ -13,7 +13,7 @@ LLDP 最小化校验器
 """
 
 import re
-from typing import List, Set, Optional
+from typing import Any, Dict, List, Set, Optional
 
 
 class ValidationResult:
@@ -84,7 +84,7 @@ class LLDPValidator:
             cls._PORT_NAMED.match(port_id)
         )
 
-    def validate(self, lldp_packet) -> ValidationResult:
+    def validate(self, lldp_packet: Any) -> ValidationResult:
         """
         校验 LLDP 包
 
@@ -95,7 +95,7 @@ class LLDPValidator:
             ValidationResult — is_valid=True 始终放行，但携带告警
         """
         self._total_checked += 1
-        warnings = []
+        warnings: List[str] = []
 
         # 1. Chassis ID 已知性
         chassis_hex = lldp_packet.chassis_mac.hex(':')
@@ -118,7 +118,7 @@ class LLDPValidator:
 
         return ValidationResult(is_valid=True, warnings=warnings)
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         return {
             "known_devices": self.known_count,
             "total_checked": self._total_checked,

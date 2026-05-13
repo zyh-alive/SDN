@@ -286,21 +286,3 @@ def parse_lldp_frame(raw_data: bytes) -> Optional[LLDPPacket]:
         src_dpid=mac_to_dpid(chassis_mac),
         src_port=src_port,
     )
-
-
-def extract_edge_info(raw_data: bytes) -> Optional[Tuple[int, Optional[int]]]:
-    """
-    从 LLDP 包中提取拓扑边信息（便捷方法）
-
-    从 LLDP 包中提取 (src_dpid, src_port)，用于拓扑发现的入口。
-
-    Args:
-        raw_data: 原始数据包字节
-
-    Returns:
-        (dpid, port) 或 None（port 可能为 None）
-    """
-    parsed = parse_lldp_frame(raw_data)
-    if parsed is None:
-        return None
-    return parsed.src_dpid, parsed.src_port

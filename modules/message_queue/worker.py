@@ -15,11 +15,15 @@
     对同一队列的竞争消费问题
 """
 
+import logging
 import queue
 import struct
 import time
 import threading
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from queue import Queue
 
 
 class StructuredMessage:
@@ -57,12 +61,12 @@ class SecurityFilter:
 
     VALID_ETHERTYPES = {0x0800, 0x0806, 0x86DD, 0x88CC, 0x8100, 0x8847, 0x8848}
 
-    def __init__(self, logger=None):
-        self.logger = logger
+    def __init__(self, logger: Any = None):
+        self.logger: Any = logger
         self._total_checked = 0
         self._total_dropped = 0
 
-    def check(self, raw_data: bytes) -> tuple:
+    def check(self, raw_data: bytes) -> Tuple[bool, int]:
         """
         安全过滤入口
 
@@ -104,12 +108,12 @@ class SecurityFilter:
 
         return True, ethertype
 
-    def _log_drop(self, reason: str, detail):
+    def _log_drop(self, reason: str, detail: Any):
         self._total_dropped += 1
         if self.logger:
             self.logger.debug(f"SecurityFilter: drop ({reason}, detail={detail})")
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         return {
             "total_checked": self._total_checked,
             "total_dropped": self._total_dropped,
@@ -135,10 +139,10 @@ class Worker:
 
     def __init__(self, worker_id: int, queue_size: int = 10000):
         self.worker_id = worker_id
-        self.logger = None  # 由外部注入
+        self.logger: Any = None  # 由外部注入
 
         # ── 输入队列（Dispatcher → Worker 线程） ──
-        self.input_queue = queue.Queue(maxsize=queue_size)
+        self.input_queue: "Queue[Any]" = queue.Queue(maxsize=queue_size)
 
         # 安全过滤器（每个 Worker 独立实例）
         self._security_filter = SecurityFilter()
@@ -147,9 +151,9 @@ class Worker:
         # topo_east_queue: LLDP → 拓扑发现模块（TopologyProcessor）
         # perf_east_queue: IP   → 性能检测模块（PerformanceMonitor）
         # west_queue:      ARP/OTHER → 路由管理模块（Phase 4）
-        self.topo_east_queue: queue.Queue = queue.Queue(maxsize=queue_size)
-        self.perf_east_queue: queue.Queue = queue.Queue(maxsize=queue_size)
-        self.west_queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self.topo_east_queue: "Queue[Any]" = queue.Queue(maxsize=queue_size)
+        self.perf_east_queue: "Queue[Any]" = queue.Queue(maxsize=queue_size)
+        self.west_queue: "Queue[Any]" = queue.Queue(maxsize=queue_size)
 
         # ── 线程状态 ──
         self._running = False
@@ -162,43 +166,6 @@ class Worker:
         self._total_west = 0
         self._total_dropped = 0
         self._total_no_input = 0
-
-    def set_output_queues(self, topo_q: queue.Queue, perf_q: queue.Queue, west_q: queue.Queue):
-        """
-        替换输出队列为外部共享队列（多 Worker 写同一队列）
-
-        调用此方法后，所有 Worker 将写入同一个 topo_q / perf_q / west_q，
-        消费端只需从一个队列取消息，无需轮询多队列。
-
-        Args:
-            topo_q: 共享拓扑队列（LLDP 消息）
-            perf_q: 共享性能队列（IP 消息）
-            west_q: 共享西向队列（ARP/OTHER 消息）
-        """
-        self.topo_east_queue = topo_q
-        self.perf_east_queue = perf_q
-        self.west_queue = west_q
-
-    # ──────────────────────────────────────────────
-    # 兼容旧接口（外部可能直接访问 east_queue）
-    # ──────────────────────────────────────────────
-
-    @property
-    def east_queue(self):
-        """
-        向后兼容：返回 topo_east_queue。
-        新代码应直接使用 topo_east_queue / perf_east_queue。
-        """
-        return self.topo_east_queue
-
-    # ──────────────────────────────────────────────
-    # 生命周期
-    # ──────────────────────────────────────────────
-
-    def set_logger(self, logger):
-        """注入日志器"""
-        self.logger = logger
-        self._security_filter.logger = logger
 
     def start(self):
         """启动 Worker 处理线程"""
@@ -214,14 +181,6 @@ class Worker:
         if self.logger:
             self.logger.debug(f"[Worker-{self.worker_id}] Thread started")
 
-    def stop(self):
-        """停止 Worker 处理线程"""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self.logger:
-            self.logger.debug(f"[Worker-{self.worker_id}] Thread stopped")
 
     # ──────────────────────────────────────────────
     # 线程主循环
@@ -236,7 +195,7 @@ class Worker:
         """
         while self._running:
             try:
-                msg = self.input_queue.get(timeout=0.5)
+                msg = self.input_queue.get(timeout=0.5) 
             except queue.Empty:
                 self._total_no_input += 1
                 continue
@@ -253,7 +212,7 @@ class Worker:
     # 核心处理逻辑（单条消息，仅在 Worker 线程内调用）
     # ──────────────────────────────────────────────
 
-    def _handle_one(self, msg) -> Optional[StructuredMessage]:
+    def _handle_one(self, msg: Any) -> Optional[StructuredMessage]:
         """
         处理单条消息（内部方法，由 _run_loop 调用）
 
@@ -332,25 +291,8 @@ class Worker:
             )
 
         return structured
-
-    # ──────────────────────────────────────────────
-    # 公共接口（保留 handle() 用于测试/直接调用场景）
-    # ──────────────────────────────────────────────
-
-    def handle(self, msg) -> Optional[StructuredMessage]:
-        """
-        同步处理入口（保留用于测试和兼容场景）
-
-        注意：多线程架构下 Dispatcher 通过 input_queue.put() 分发，
-        不再调用此方法。此方法仅用于纯 Python 单元测试中直接调用。
-        """
-        return self._handle_one(msg)
-
-    # ──────────────────────────────────────────────
-    # 工具方法
-    # ──────────────────────────────────────────────
-
-    def _put_to_queue(self, q: queue.Queue, item):
+    
+    def _put_to_queue(self, q: "Queue[Any]", item: Any):
         """线程安全地放入队列，满时丢弃最旧消息"""
         try:
             q.put_nowait(item)
@@ -362,7 +304,7 @@ class Worker:
             except queue.Empty:
                 pass
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, Any]:
         return {
             "worker_id": self.worker_id,
             "total_handled": self._total_handled,

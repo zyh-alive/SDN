@@ -21,7 +21,7 @@
 
 import time
 from collections import deque
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 
 class LinkMetrics:
@@ -40,7 +40,7 @@ class LinkMetrics:
         self.packet_loss = packet_loss # %
         self.timestamp = timestamp or time.time()
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "link_id": {
                 "src_dpid": f"{self.link_id[0]:016x}",
@@ -90,17 +90,17 @@ class MetricsCalculator:
         # 使用 get() 而非 pop() — 同一 LLDP 广播可被多台交换机接收
         self._lldp_send_times: Dict[Tuple[int, int], float] = {}
         # 时延历史：{link_id: deque of (timestamp, delay_ms)}
-        self._delay_history: Dict[Tuple, deque] = {}
+        self._delay_history: Dict[Tuple[int, int, int, int], "deque[Tuple[float, float]]"] = {}
         self._max_delay_history = 1000
 
         # ── LLDP 丢包率 ──
         # 发送计数（按 src 端口）：{(dpid, port_no): count}
         self._lldp_sent_counts: Dict[Tuple[int, int], int] = {}
         # 接收计数（按 link_id）：{(src_dpid, src_port, dst_dpid, dst_port): count}
-        self._lldp_recv_counts: Dict[Tuple, int] = {}
+        self._lldp_recv_counts: Dict[Tuple[int, int, int, int], int] = {}
 
         # ── 链路吞吐量缓存（由 monitor 在 STATS_REPLY 处理中写入） ──
-        self._link_throughput: Dict[Tuple, float] = {}
+        self._link_throughput: Dict[Tuple[int, int, int, int], float] = {}
 
     # ──────────────────────────────────────────────
     # 吞吐量接口（STATS_REPLY → 端口字节计数器）
@@ -246,11 +246,11 @@ class MetricsCalculator:
             timestamp=now,
         )
 
-    def _calc_throughput(self, link_id: Tuple) -> float:
+    def _calc_throughput(self, link_id: Tuple[int, int, int, int]) -> float:
         """返回缓存的链路吞吐量（由 monitor 在 STATS_REPLY 处理中写入）"""
         return self._link_throughput.get(link_id, 0.0)
 
-    def _calc_delay(self, link_id: Tuple, now: float) -> float:
+    def _calc_delay(self, link_id: Tuple[int, int, int, int], now: float) -> float:
         """
         时延：取最近 HISTORY_WINDOW 秒内 LLDP 时延采样的中位数
 
@@ -271,7 +271,7 @@ class MetricsCalculator:
             return (recent[n // 2 - 1] + recent[n // 2]) / 2.0
         return recent[n // 2]
 
-    def _calc_jitter(self, link_id: Tuple, now: float) -> float:
+    def _calc_jitter(self, link_id: Tuple[int, int, int, int], now: float) -> float:
         """
         抖动：最近两次 LLDP 时延采样差的绝对值
 
@@ -287,7 +287,7 @@ class MetricsCalculator:
 
         return abs(recent[-1][1] - recent[-2][1])
 
-    def _calc_loss(self, link_id: Tuple) -> float:
+    def _calc_loss(self, link_id: Tuple[int, int, int, int]) -> float:
         """
         丢包率：LLDP 发送/接收计数
 
@@ -310,7 +310,7 @@ class MetricsCalculator:
     # 活跃链路查询
     # ──────────────────────────────────────────────
 
-    def get_active_link_ids(self) -> set:
+    def get_active_link_ids(self) -> Set[Tuple[int, int, int, int]]:
         """
         返回所有活跃链路 ID 集合
 
@@ -325,7 +325,7 @@ class MetricsCalculator:
     # 重置
     # ──────────────────────────────────────────────
 
-    def reset(self, link_id: Optional[Tuple] = None):
+    def reset(self, link_id: Optional[Tuple[int, int, int, int]] = None):
         """重置单链路或全部统计"""
         if link_id:
             self._link_throughput.pop(link_id, None)
@@ -342,7 +342,7 @@ class MetricsCalculator:
             self._lldp_recv_counts.clear()
             self._link_throughput.clear()
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, int]:
         return {
             "ports_tracked": len(self._port_snapshots),
             "delay_sampled_links": len(self._delay_history),

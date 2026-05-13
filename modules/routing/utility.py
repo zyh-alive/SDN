@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .utility_bandwidth import bandwidth_utility
 from .utility_delay import delay_utility
@@ -25,7 +25,7 @@ from .utility_loss import loss_utility
 # Profile 定义（PDF 表2.4-2.7）
 # ──────────────────────────────────────────────
 
-PROFILES: Dict[str, dict] = {
+PROFILES: Dict[str, Dict[str, Any]] = {
     "realtime": {
         "name": "会话类",
         "weights": {"bw": 0.20, "delay": 0.45, "jitter": 0.25, "loss": 0.10},
@@ -70,39 +70,6 @@ PROFILES: Dict[str, dict] = {
 
 # 混合因子（PDF 式 2-18）：混合类 = realtime × 0.4 + streaming × 0.6
 HYBRID_FACTORS = {"realtime": 0.4, "streaming": 0.6}
-
-
-# ──────────────────────────────────────────────
-# 公开 API
-# ──────────────────────────────────────────────
-
-def link_utility(
-    throughput: float,
-    delay: float,
-    jitter: float,
-    packet_loss: float,
-    profile: str = "realtime",
-) -> float:
-    """计算单条链路的综合效用值（不适用加权合成，仅调试用）。
-
-    Args:
-        throughput:  吞吐量 (bps)
-        delay:       时延 (ms)
-        jitter:      抖动 (ms)
-        packet_loss: 丢包率 (0-1)
-        profile:     Profile 名称 ("realtime"|"streaming"|"interactive"|"bulk"|"other")
-
-    Returns:
-        综合效用值
-    """
-    cfg = PROFILES.get(profile, PROFILES["realtime"])
-    w = cfg["weights"]
-
-    ub = bandwidth_utility(throughput / 1e6, **cfg["bw"])
-    ud = delay_utility(delay, **cfg["delay"]) if w["delay"] > 0 else 0.0
-    uj = jitter_utility(jitter, **cfg["jitter"]) if w["jitter"] > 0 else 0.0
-    ul = loss_utility(packet_loss, **cfg["loss"]) if w["loss"] > 0 else 0.0
-    return w["bw"] * ub + w["delay"] * ud + w["jitter"] * uj + w["loss"] * ul
 
 
 def path_utility(

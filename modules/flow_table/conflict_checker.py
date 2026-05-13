@@ -31,7 +31,7 @@ class ConflictResult:
     def __init__(self):
         self.has_conflict = False
         self.severity = "none"
-        self.conflicts: List[Dict] = []
+        self.conflicts: List[Dict[str, str]] = []
 
     def add(self, severity: str, rule_a: str, rule_b: str, detail: str):
         """添加一条冲突记录。"""
@@ -56,24 +56,10 @@ class ConflictResult:
 #  匹配域重叠检测
 # ──────────────────────────────────────────────
 
-# 精确匹配字段（必须完全相等才算重叠）
-EXACT_FIELDS = {
-    "in_port",
-    "eth_type",
-    "ip_proto",
-    "tcp_src", "tcp_dst",
-    "udp_src", "udp_dst",
-}
-
 # 前缀匹配字段（IP 地址，规则 A 的网段包含规则 B 的网段即重叠）
 PREFIX_FIELDS = {
     "ipv4_src", "ipv4_dst",
     "ipv6_src", "ipv6_dst",
-}
-
-# 通配字段（MAC 地址通常精确匹配，但可能有掩码）
-ADDRESS_FIELDS = {
-    "eth_src", "eth_dst",
 }
 
 
