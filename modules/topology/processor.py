@@ -324,9 +324,9 @@ class TopologyProcessor:
         → RouteManager.on_events()
     """
 
-    # LLDP 超时时间（秒）— 容许多个周期无 LLDP 后才判定链路 DOWN
-    # 20s ≈ 10 × LLDP_INTERVAL(2s)，足够容忍短时消费积压
-    LINK_TIMEOUT = 20.0
+    # LLDP 超时时间（秒）— 5 个周期无 LLDP 后判定链路 DOWN
+    # 队列合并后消费瓶颈已消除，10s 足够容忍偶发抖动，同时快速感知真故障
+    LINK_TIMEOUT = 10.0
 
     # 超时扫描间隔（对齐 LLDP 下发周期）
     TIMEOUT_SCAN_INTERVAL = 2.0
