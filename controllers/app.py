@@ -242,13 +242,27 @@ class SDNController(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)  # type: ignore[attr-defined]
     # SwitchFeatures 事件处理器：安装默认流表 + 注册交换机到 LLDP 采集器 + 注册 datapath 到流表下发注册表
     #datapath 表示一个交换机对象，包含了交换机的连接信息和通信接口。每当一个交换机连接到控制器时，Ryu 会触发一个 SwitchFeatures 事件，并将该交换机的 datapath 对象作为事件参数传递给事件处理器。
-    def switch_features_handler(self, ev): 
+    def switch_features_handler(self, ev):
         datapath = ev.msg.datapath # 获取交换机连接的 datapath 对象，msg表示事件消息，datapath 属性包含了交换机的连接信息和通信接口
         ofproto = datapath.ofproto # 获取 OpenFlow 协议相关常量和类
         parser = datapath.ofproto_parser # parser表示一个用于构造 OpenFlow 消息的对象，提供了各种方法来创建不同类型的 OpenFlow 消息，例如 FlowMod、PacketOut 等
         dpid = datapath.id # 获取交换机的 DPID（Datapath ID），这是一个唯一标识交换机的 64 位整数，通常以十六进制格式表示
 
-        # 默认流表：所有包上送控制器
+        # Bug 10 修复：添加高优先级 LLDP 流表，确保 LLDP 帧始终上送控制器。
+        # OVS 内核可能对未知组播 MAC 采取不同的处理策略（尤其当 forward-bpdus=false 时），
+        # 显式流表可以绕过内核的组播过滤逻辑。
+        lldp_match = parser.OFPMatch(eth_type=0x88CC)
+        lldp_actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        lldp_inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, lldp_actions)]
+        lldp_mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=200,
+            match=lldp_match,
+            instructions=lldp_inst,
+        )
+        datapath.send_msg(lldp_mod)
+
+        # 默认流表：所有包上送控制器（table-miss，priority=0）
         match = parser.OFPMatch() # 创建一个空的匹配对象，表示匹配所有流量，ofpmatch表示OpenFlow 匹配结构（用来描述"匹配什么条件的包"）
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]  # type: ignore[reportUnknownVariableType]
         #动作为列表，因为一个流表可以有多action，OFPActionOutput表示发往哪个端口，这里是OFPP_CONTROLLER，表示发送到控制器，OFPCML_NO_BUFFER表示不缓存数据包，直接发送完整数据包到控制器
@@ -289,6 +303,15 @@ class SDNController(app_manager.RyuApp):
         """
         datapath = ev.datapath
         dpid = datapath.id
+
+        # 握手阶段断连时 dpid 可能为 None（尚未收到 FEATURES_REPLY）
+        if dpid is None:
+            self.logger.warning(
+                "🔌 交换机在握手完成前断开 (%s) — 无需清理",
+                datapath.address[0] if datapath.address else "unknown",
+            )
+            return
+
         chassis_mac = dpid_to_mac(dpid)
 
         # 1. 流表注册表（停止对该交换机下发流表）
@@ -356,7 +379,7 @@ class SDNController(app_manager.RyuApp):
         # raw_data[12:14]提取以太网帧中的EtherType字段，该字段位于以太网头部的第12和13字节位置，
         # 解析出的ethertype将用于后续的分向逻辑，
         # 根据不同的EtherType值将PacketIn消息分发到不同的处理模块（LLDP → 东向 RingBuffer, ARP/IP → 西向 ArpHandler）
-
+        self.logger.info(f"[DEBUG] packet_in: ethertype=0x{ethertype:04x}")
         # ── 3. 提取公共元信息 ──
         try:
             dpid: Any = datapath.id

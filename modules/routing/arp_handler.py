@@ -294,7 +294,9 @@ class ArpHandler:
             # 请求者已知 → 直接转发 ARP Reply 到其端口
             dp = self._dp_registry.get(target_entry.dpid) if self._dp_registry else None
             if dp:
-                self._packet_out(dp, msg.data, target_entry.port,
+                # Bug 14 同样修复：使用 OFPP_CONTROLLER 作为 in_port，避免
+                # in_port == out_port 导致 OVS 静默丢弃 PacketOut。
+                self._packet_out(dp, msg.data, dp.ofproto.OFPP_CONTROLLER,
                                  out_port=target_entry.port)
                 self._total_arp_replies_fwd += 1
                 self.logger.debug(
@@ -326,6 +328,7 @@ class ArpHandler:
           Offset 26-29: 源 IP（4 bytes）
           Offset 30-33: 目标 IP（4 bytes）
         """
+        self.logger.info(f"[DEBUG] _handle_ip: {msg.dpid}:{msg.in_port}")
         self._total_ip_handled += 1
         raw = msg.data
 
@@ -378,8 +381,12 @@ class ArpHandler:
         flow_key = (src_ip, dst_ip)
         with self._deployed_lock:
             if flow_key in self._deployed_flows:
-                return  # 已下发过
-
+                 # 流表已下发，但仍需转发当前包（可能是第一个 ICMP 包）
+                src_host = self._lookup_ip(src_ip)
+                dst_host = self._lookup_ip(dst_ip)
+                if src_host and dst_host:
+                    self._forward_first_packet(msg, src_host, dst_host=dst_host)
+                return
         src_host = self._lookup_ip(src_ip)
         dst_host = self._lookup_ip(dst_ip)
 
@@ -404,11 +411,26 @@ class ArpHandler:
                     src_host.dpid, dst_host.dpid, profile="realtime"
                 )
                 if route is None:
-                    self.logger.debug(
-                        f"[ArpHandler] No route cached for "
-                        f"{src_host.dpid}→{dst_host.dpid}"
+                    # Bug 9 修复：路由缓存可能因时序竞态尚未填充
+                    # （拓扑事件通过 Redis Stream → StalkerManager 异步通知，
+                    #   防抖窗口 2-5s + XREADGROUP 超时 5s 导致
+                    #   路由重算延迟于 ARP/IP 首包到达）
+                    # 此时主动触发一次 recompute_all() 从内存图谱重算并重试
+                    self.logger.warning(
+                        f"[ArpHandler] Route cache miss for "
+                        f"{src_host.dpid}→{dst_host.dpid}, "
+                        f"triggering on-demand recompute..."
                     )
-                    return
+                    self._route_manager.recompute_all()
+                    route = self._route_manager.get_route(
+                        src_host.dpid, dst_host.dpid, profile="realtime"
+                    )
+                    if route is None:
+                        self.logger.error(
+                            f"[ArpHandler] Still no route after on-demand recompute "
+                            f"for {src_host.dpid}→{dst_host.dpid}"
+                        )
+                        return
 
                 # 获取拓扑图谱
                 graph: Dict[str, Any] = {}
@@ -445,7 +467,7 @@ class ArpHandler:
                     rules, remove_old=False,
                 )
                 self._total_flows_deployed += deployed
-
+                self.logger.info(f"[DEBUG] deploy_rules result: deployed={deployed}, failed={failed}")
                 if deployed > 0:
                     self.logger.info(
                         f"[ArpHandler] Flow deployed: {src_ip}({src_host.mac}) "
@@ -454,7 +476,8 @@ class ArpHandler:
                     )
 
             # Bug 5 修复：流表下发成功后立即 Forward 首包到首跳出端口
-            self._forward_first_packet(msg, src_host)
+            # Bug 12 修复：传入 dst_host 以支持同交换机首包转发
+            self._forward_first_packet(msg, src_host, dst_host=dst_host)
 
             # 标记已下发
             with self._deployed_lock:
@@ -501,12 +524,20 @@ class ArpHandler:
     #  首包转发（Bug 5 修复）
     # ──────────────────────────────────────────────
 
-    def _forward_first_packet(self, msg: Optional[StructuredMessage], src_host: HostEntry):
+    def _forward_first_packet(self, msg: Optional[StructuredMessage], src_host: HostEntry,
+                              dst_host: Optional[HostEntry] = None):
         """
         流表下发后将触发本次下发的首包通过 PacketOut 转发出去。
 
         Bug 5 修复：此前首包虽然触发了流表下发，但原始包被控制器丢弃，
         导致首包丢失，ICMP 收不到回复。
+
+        Bug 12 修复（同交换机首包转发缺失）：
+        此前 _forward_first_packet 依赖 RouteManager.get_route() 查首跳出端口，
+        但同交换机场景下 src_dpid==dst_dpid，RouteManager 不会计算自环路由，
+        get_route(same, same) 返回 None → out_port 永远为 None → 首包被丢弃。
+        
+        修复：添加 dst_host 参数，同交换机时直接用 dst_host.port 作为 out_port。
         """
         if msg is None:
             return
@@ -521,26 +552,25 @@ class ArpHandler:
                 graph = self._topology_graph.get_full()
             links: Dict[str, Any] = graph.get("links", {})
 
-            # 首跳交换机就是 src_host.dpid
-            # 需要找到该交换机的出端口（朝向下一跳）
-            # 如果 src_dpid == dst_dpid（同交换机），出端口就是 dst_host.port
-            # 跨交换机场景需要查路由
-
             out_port = None
 
-            # 先从路由缓存中找路径的首跳出端口
-            route = self._route_manager.get_route(
-                src_host.dpid, self._lookup_dst_dpid(msg),
-                profile="realtime",
-            ) if self._route_manager else None
+            # Bug 12: 同交换机场景直接使用 dst_host.port
+            if dst_host is not None and src_host.dpid == dst_host.dpid:
+                out_port = dst_host.port
+            else:
+                # 跨交换机：从路由缓存中找路径的首跳出端口
+                route = self._route_manager.get_route(
+                    src_host.dpid, self._lookup_dst_dpid(msg),
+                    profile="realtime",
+                ) if self._route_manager else None
 
-            if route:
-                if route.get("is_p0"):
-                    primary = route.get("p0", {}).get("primary")
-                else:
-                    primary = route.get("p1", {}).get("primary")
-                if primary and primary.path and len(primary.path) >= 2:
-                    out_port = _find_out_port(links, primary.path[0], primary.path[1])
+                if route:
+                    if route.get("is_p0"):
+                        primary = route.get("p0", {}).get("primary")
+                    else:
+                        primary = route.get("p1", {}).get("primary")
+                    if primary and primary.path and len(primary.path) >= 2:
+                        out_port = _find_out_port(links, primary.path[0], primary.path[1])
 
             if out_port is not None:
                 self._packet_out(dp, msg.data, src_host.port, out_port=out_port)
@@ -638,48 +668,58 @@ class ArpHandler:
     # ──────────────────────────────────────────────
     #  ARP Reply 构造与发送
     # ──────────────────────────────────────────────
+    def _send_arp_reply(self, dpid, in_port, sender_mac, sender_ip, target_mac, target_ip):
+        """
+        构造并发送 ARP Reply。
 
-    def _send_arp_reply(
-        self,
-        dpid: int,
-        in_port: int,
-        sender_mac: str,
-        sender_ip: str,
-        target_mac: str,
-        target_ip: str,
-    ):
+        Bug 13 修复：当 ARP Request 经过泛洪到达非请求者直连的交换机时（如 s2 收到
+        来自 s1 洪泛的 ARP Request），原来的代码以 msg.dpid（s2）作为 PacketOut 目标
+        交换机，但 out_port 却是请求者在 s1 上的端口号，导致 ARP Reply 被发往错误端口。
+
+        修复：始终从请求者（target）所在的交换机发往请求者端口。
+              请求者 mac=target_mac, ip=target_ip → 查表得 target_entry(dpid, port)
+              → PacketOut 到 target_entry.dpid:target_entry.port
         """
-        构造 ARP Reply 帧并通过 PacketOut 发送到对应交换机端口。
-        """
-        dp = None
-        if self._dp_registry:
-            dp = self._dp_registry.get(dpid)
+        # 查找请求者（target）的主机条目
+        target_entry = self._lookup_ip(target_ip)
+        if target_entry is None:
+            self.logger.error(
+                f"[ArpHandler] Cannot find target (requester) {target_ip} in host table"
+            )
+            return
+        self.logger.info(f"[ARP_DEBUG] _send_arp_reply: target_ip={target_ip}, target_dpid={target_entry.dpid}, target_port={target_entry.port}")
+        # Bug 13: 从请求者所在的交换机发送，而非收到 ARP Request 的交换机
+        dp = self._dp_registry.get(target_entry.dpid)
         if dp is None:
+            self.logger.error(
+                f"[ArpHandler] Cannot find datapath for dpid={target_entry.dpid} "
+                f"(requester {target_ip} is on this switch)"
+            )
             return
 
-        # 以太网头
+        out_port = target_entry.port
+
+        # 构造 ARP Reply 帧
         eth = (
-            _mac_str_to_bytes(target_mac)      # 目标 MAC
-            + _mac_str_to_bytes(sender_mac)    # 源 MAC
-            + struct.pack("!H", ETH_TYPE_ARP)  # EtherType
+            _mac_str_to_bytes(target_mac)      # 以太网目标 MAC（请求者）
+            + _mac_str_to_bytes(sender_mac)    # 以太网源 MAC（应答者）
+            + struct.pack("!H", ETH_TYPE_ARP)
         )
-
-        # ARP 头
-        arp = struct.pack(
-            "!HHBBH",
-            1,              # 硬件类型：以太网
-            0x0800,         # 协议类型：IPv4
-            6,              # 硬件地址长度
-            4,              # 协议地址长度
-            ARP_REPLY,      # 操作码：Reply
-        )
-        arp += _mac_str_to_bytes(sender_mac)   # 发送方 MAC
-        arp += _ip_str_to_bytes(sender_ip)     # 发送方 IP
-        arp += _mac_str_to_bytes(target_mac)   # 目标 MAC
-        arp += _ip_str_to_bytes(target_ip)     # 目标 IP
-
+        arp = struct.pack("!HHBBH", 1, 0x0800, 6, 4, ARP_REPLY)
+        arp += _mac_str_to_bytes(sender_mac)   # ARP 发送方 MAC（应答者）
+        arp += _ip_str_to_bytes(sender_ip)     # ARP 发送方 IP（被查询的 IP）
+        arp += _mac_str_to_bytes(target_mac)   # ARP 目标 MAC（请求者）
+        arp += _ip_str_to_bytes(target_ip)     # ARP 目标 IP（请求者）
         packet = eth + arp
-        self._packet_out(dp, packet, in_port)
+
+        # Bug 14 修复：PacketOut 的 in_port 必须 ≠ out_port，否则 OVS 会丢弃。
+        # 控制器生成的包应使用 OFPP_CONTROLLER 作为 in_port，表示"由控制器注入而非物理端口收发"。
+        self._packet_out(dp, packet, dp.ofproto.OFPP_CONTROLLER, out_port=out_port)
+        self.logger.info(
+            f"[ArpHandler] ARP Reply: {sender_ip}→{target_ip} "
+            f"via dpid={target_entry.dpid}, out_port={out_port} "
+            f"(received at dpid={dpid}, in_port={in_port})"
+        )
 
     # ──────────────────────────────────────────────
     #  泛洪
@@ -717,12 +757,20 @@ class ArpHandler:
     def _packet_out(self, dp: Any, data: bytes, in_port: int, out_port: Optional[int] = None) -> None:
         """
         发送 PacketOut 消息到交换机。
+
+        Bug 11 修复：此前 out_port=None 时默认使用 OFPP_TABLE，
+        导致 ARP Reply 重新进入 OpenFlow 流水线 → 命中 table-miss（priority=0）
+        → PacketIn → 控制器再次处理 → 再次 _packet_out → 死循环。
+        修复后 out_port=None 时使用 OFPP_FLOOD 作为兜底（仅用于泛洪场景）。
+        调用方（_send_arp_reply / _handle_arp_reply）应显式传入目标端口号。
         """
+        self.logger.info(f"[ARP_DEBUG] _packet_out: dpid={dp.id}, in_port={in_port}, out_port={out_port}")
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
         if out_port is None:
-            out_port = ofproto.OFPP_TABLE
+            # 安全兜底：泛洪而非回表（OFPP_TABLE 会导致死循环）
+            out_port = ofproto.OFPP_FLOOD
 
         actions = [parser.OFPActionOutput(out_port)]
         out = parser.OFPPacketOut(

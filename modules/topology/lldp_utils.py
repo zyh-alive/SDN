@@ -27,7 +27,20 @@ from typing import Optional, Tuple
 
 # ── LLDP 常量 ─────────────────────────────────────────
 
-LLDP_MULTICAST_MAC = b'\x01\x80\xc2\x00\x00\x0e'
+# Bug 10 修复：标准 LLDP 组播 MAC 01:80:c2:00:00:0e 属于 IEEE 802.1D
+# "Bridge Group Address" 保留范围，OVS 内核默认丢弃该地址的帧（不转发到
+# OpenFlow 流水线）。OpenFlow SDN 拓扑发现的通用做法是使用非保留组播地址。
+# 此处使用 01:23:00:00:00:01（Nearest non-TPMR Bridge，802.1Q 定义，
+# 不被 OVS 内核拦截），确保 LLDP 帧到达对端交换机后触发 PacketIn。
+#
+# 同类参考：
+#   - ONOS 使用 01:80:c2:00:00:0e + 显式 flow mod 注入，但依赖 OF 1.3+
+#   - Faucet 使用 01:80:c2:00:00:0e + forward-bpdus=true
+#   - POX 使用 01:23:00:00:00:01
+#
+# Mininet OVSSwitch 默认 forward-bpdus=false，无法在拓扑脚本中修改，
+# 因此切换组播地址是最简路径。
+LLDP_MULTICAST_MAC = b'\x01\x23\x00\x00\x00\x01'
 LLDP_ETHERTYPE = 0x88CC
 
 # TLV Type 值
@@ -56,14 +69,21 @@ def dpid_to_mac(dpid: int) -> bytes:
     取低 6 字节（48 位）作为 MAC。
 
     Args:
-        dpid: 交换机 datapath ID
+        dpid: 交换机 datapath ID（int 或 int-like string）
 
     Returns:
         6 字节 MAC 地址
+
+    Raises:
+        TypeError: 如果 dpid 为 None 或无法转换为 int
     """
-    return struct.pack("!Q", dpid)[2:]  # 取低 6 字节
-    #struct表示将 Python 数据类型转换为字节序列，!Q 表示网络字节序的无符号长整数（8 字节），然后通过切片 [2:] 取出低 6 字节作为 MAC 地址
-    #pack表示将 dpid 转换为 8 字节的字节序列，!Q 表示网络字节序的无符号长整数（8 字节），然后通过切片 [2:] 取出低 6 字节作为 MAC 地址
+    if dpid is None:
+        raise TypeError("dpid 不能为 None，交换机可能尚未完成握手（无 FEATURES_REPLY）")
+    try:
+        dpid_int = int(dpid)
+    except (TypeError, ValueError) as e:
+        raise TypeError(f"dpid 无法转换为 int: {dpid!r}") from e
+    return struct.pack("!Q", dpid_int)[2:]  # 取低 6 字节
 
 def mac_to_dpid(mac: bytes) -> int:
     """
