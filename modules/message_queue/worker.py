@@ -41,11 +41,13 @@ class StructuredMessage:
     TYPE_LLDP = "LLDP"
     TYPE_ARP = "ARP"
     TYPE_IP = "IP"
+    TYPE_MIRROR = "MIRROR"  # 流表镜像包（OFPP_CONTROLLER → 仅送分类队列）
     TYPE_OTHER = "OTHER"
 
     def __init__(self, msg_type: str, dpid: int, in_port: int,
                  data: bytes, timestamp: Optional[float] = None,
-                 ethertype: int = 0, src_mac: str = "", dst_mac: str = ""):
+                 ethertype: int = 0, src_mac: str = "", dst_mac: str = "",
+                 reason: int = 0):
         self.msg_type = msg_type
         self.dpid = dpid
         self.in_port = in_port
@@ -55,11 +57,12 @@ class StructuredMessage:
         self.ethertype = ethertype      # EtherType 整数（0x0800, 0x0806, 0x88CC）
         self.src_mac = src_mac          # 源 MAC（格式化字符串 "xx:xx:xx:xx:xx:xx"）
         self.dst_mac = dst_mac          # 目标 MAC（格式化字符串）
+        self.reason = reason            # PacketIn reason (0=NO_MATCH, 1=ACTION 镜像)
 
     def __repr__(self):
         return (f"StructuredMessage(type={self.msg_type}, "
                 f"dpid={self.dpid:016x}, in_port={self.in_port}, "
-                f"size={len(self.data)})")
+                f"reason={self.reason}, size={len(self.data)})")
 
 
 class SecurityFilter:
@@ -179,6 +182,7 @@ class Worker:
         self._total_east = 0
         self._total_perf = 0
         self._total_west = 0
+        self._total_classification = 0  # MIRROR 镜像包计数（Phase 5）
         self._total_dropped = 0
         self._total_no_input = 0
 
@@ -250,13 +254,17 @@ class Worker:
             self._total_dropped += 1
             return None
 
+        # 提取 PacketIn reason 字段（区分 table-miss 和流表镜像）
+        msg_reason = getattr(msg, 'reason', 0)
+
         # 2. 浅解析分类（复用 check() 返回的 ethertype）
         if ethertype == 0x88CC:
             msg_type = StructuredMessage.TYPE_LLDP
         elif ethertype == 0x0806:
             msg_type = StructuredMessage.TYPE_ARP
         elif ethertype == 0x0800 or ethertype == 0x86DD:
-            msg_type = StructuredMessage.TYPE_IP
+            # OFPR_ACTION (1): 流表镜像包 → 仅送分类队列，不干扰 ArpHandler
+            msg_type = StructuredMessage.TYPE_MIRROR if msg_reason == 1 else StructuredMessage.TYPE_IP
         else:
             msg_type = StructuredMessage.TYPE_OTHER
 
@@ -283,6 +291,7 @@ class Worker:
             ethertype=ethertype,
             src_mac=src_mac,
             dst_mac=dst_mac,
+            reason=msg_reason,
         )
 
         # 5. 按类型路由到输出队列
@@ -295,12 +304,16 @@ class Worker:
             self._total_east += 1
             self._total_perf += 1
         elif msg_type == StructuredMessage.TYPE_IP:
-            # IP → 西向队列（ArpHandler 消费：首包触发路由查找 → 流表下发）
+            # IP（table-miss，首包） → 西向队列（ArpHandler 消费：路由查找 → 流表下发）
             #     + 分类队列（FlowTracker 消费：五元组聚合 → 流量分类，Phase 5）
-            # 性能检测不再消费 IP 包（改用 LLDP 时延 + STATS_REQUEST 吞吐量）
             self._put_to_queue(self.west_queue, structured)
             self._put_to_queue(self.classification_queue, structured)
             self._total_west += 1
+        elif msg_type == StructuredMessage.TYPE_MIRROR:
+            # 流表镜像包（OFPP_CONTROLLER，仅包头 128B） → 仅分类队列
+            # 不送 west_queue（避免 ArpHandler 在已有流表时重复处理）
+            self._put_to_queue(self.classification_queue, structured)
+            self._total_classification += 1
         else:
             # ARP / OTHER → 西向队列（ArpHandler 消费：主机学习 + 泛洪/回复）
             self._put_to_queue(self.west_queue, structured)
@@ -356,12 +369,14 @@ class Worker:
             "east_count": self._total_east,
             "perf_count": self._total_perf,
             "west_count": self._total_west,
+            "classification_count": self._total_classification,
             "dropped": self._total_dropped,
             "no_input": self._total_no_input,
             "input_queue_size": self.input_queue.qsize(),
             "topo_east_queue_size": self.topo_east_queue.qsize(),
             "perf_east_queue_size": self.perf_east_queue.qsize(),
             "west_queue_size": self.west_queue.qsize(),
+            "classification_queue_size": self.classification_queue.qsize(),
             "running": self._running,
             "security": self._security_filter.stats(),
         }
@@ -372,5 +387,6 @@ class Worker:
             f"Worker({self.worker_id}) "
             f"handled={s['total_handled']} "
             f"east={s['east_count']} west={s['west_count']} "
+            f"cls={s['classification_count']} "
             f"dropped={s['dropped']} running={s['running']}"
         )

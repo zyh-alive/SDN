@@ -255,8 +255,12 @@ class FlowDeployer:
         actions: List[Any] = []
         for act in rule.actions:
             if act["type"] == "OUTPUT":
+                port = act["port"]
+                if port == "OFPP_CONTROLLER":
+                    port = ofproto.OFPP_CONTROLLER
+                max_len = act.get("max_len", ofproto.OFPCML_NO_BUFFER)
                 actions.append(
-                    parser.OFPActionOutput(act["port"])
+                    parser.OFPActionOutput(port, max_len=max_len)
                 )
             elif act["type"] == "SET_QUEUE":
                 actions.append(

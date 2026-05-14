@@ -1,17 +1,38 @@
 """
-流特征追踪器 — 从 IP 包提取五元组流特征
+流特征追踪器 — 从 IP 包提取五元组流特征（混合采样机制）
 
 职责：
   1. 消费 classification_queue 中的 IP StructuredMessage
   2. 按五元组 (src_ip, dst_ip, protocol, src_port, dst_port) 聚合流特征
-  3. 每 5s 或流包数达到阈值时输出聚合特征 → 分类
-  4. 老化空闲流（30s 无新包 → 输出并清理）
+  3. 混合采样：首 N 包全量（学习流特征） + 定期采样（更新特征）
+  4. 学习阶段完成后立即输出 → 分类；后续定期重输出
+  5. 老化空闲流（30s 无新包 → 输出并清理）
 
 设计文档 final_architecture_plan.md §10, dev_roadmap.md §Step 5.1
 
+采样机制（借鉴 sFlow / INT 统计采样思想，在控制器侧实现）：
+  ┌─────────────────────────────────────────────────────────────┐
+  │  交换机全量镜像 ─→ Worker ─→ classification_queue            │
+  │                                    │                        │
+  │                          FlowTracker 采样门                   │
+  │                                    │                        │
+  │            ┌─ packet_count < N ─── 全量接受（学习阶段）       │
+  │            │                                                │
+  │            └─ packet_count ≥ N ─── 最多 1 包/T秒（监控阶段） │
+  │                                                             │
+  │  学习阶段完成 → 立即输出分类结果                              │
+  │  监控阶段新样本 → 定期重输出（更新分类特征）                  │
+  └─────────────────────────────────────────────────────────────┘
+
+  与 sFlow 对比：
+    - sFlow: 交换机硬件按 1:N 概率采样，采样报文直接发往 collector
+    - 本方案: OpenFlow 全量镜像 + 控制器侧采样门，灵活可调
+    - 优势: 无需交换机支持 sFlow agent，OpenFlow 1.3 即可实现
+
 数据流：
-  Worker(IP packets) → classification_queue → FlowTracker._process_ip()
-    → 按 flow_key 聚合 → _flush_flow() → Classifier.predict()
+  Worker(TYPE_MIRROR packets) → classification_queue
+    → FlowTracker._process_ip() → 采样决策
+    → 按 flow_key 聚合 → _output_flow() → Classifier.predict()
     → Redis class:result:{flow_key} + MySQL flow_class_log
 
 遵循"一个功能一个文件"原则。
@@ -56,6 +77,8 @@ class FlowFeatures:
         "flow_key", "src_ip", "dst_ip", "protocol", "src_port", "dst_port",
         "packet_count", "byte_count", "avg_packet_size", "avg_iat",
         "first_seen", "last_seen", "_prev_arrival",
+        "_last_sample_time",   # 上一次采样时间（监控阶段采样门控）
+        "_last_output_count",  # 上一次输出时的 packet_count（避免重复输出）
     )
 
     def __init__(self, flow_key: str, src_ip: str, dst_ip: str,
@@ -74,6 +97,8 @@ class FlowFeatures:
         self.first_seen = arrival_time
         self.last_seen = arrival_time
         self._prev_arrival = arrival_time
+        self._last_sample_time = arrival_time
+        self._last_output_count = 0
 
     def update(self, packet_size: int, arrival_time: float) -> None:
         """更新流特征（指数移动平均）。"""
@@ -115,9 +140,15 @@ class FlowFeatures:
 
 class FlowTracker:
     """
-    流特征追踪器 — 独立线程运行。
+    流特征追踪器 — 独立线程运行，实现混合采样。
 
-    从 classification_queue 消费 IP StructuredMessage，按五元组聚合流特征。
+    从 classification_queue 消费 TYPE_MIRROR StructuredMessage，按五元组聚合流特征。
+
+    采样策略（借鉴 sFlow 统计采样思想）：
+      - 学习阶段 (packet_count < LEARNING_PACKETS): 全量接受，快速建立流特征
+      - 监控阶段 (packet_count ≥ LEARNING_PACKETS): 定期采样 (≤1 包/MONITOR_INTERVAL)
+      - 学习阶段完成 → 立即输出分类结果
+      - 监控阶段新采样 → FLUSH_INTERVAL 定期重输出（更新分类特征）
 
     Usage:
         tracker = FlowTracker(classification_queue, logger=...)
@@ -126,10 +157,13 @@ class FlowTracker:
         tracker.set_on_flow_flush(lambda features: classifier.predict(features))
     """
 
-    # 流输出触发阈值
+    # 采样控制
+    LEARNING_PACKETS = 20         # 学习阶段：首 N 包全量接受
+    MONITOR_INTERVAL = 5.0        # 监控阶段：每流最多 1 包/秒（s）
+
+    # 流输出触发
     FLUSH_INTERVAL = 5.0          # 定期输出间隔 (s)
     IDLE_TIMEOUT = 30.0           # 空闲流超时 (s)
-    PACKET_COUNT_THRESHOLD = 50   # 包数阈值（达到则立刻输出）
 
     def __init__(
         self,
@@ -176,8 +210,9 @@ class FlowTracker:
         self._thread.start()
         if self.logger:
             self.logger.info(
-                "[FlowTracker] Started (flush=%ss, idle=%ss, pkt_threshold=%d)",
-                self.FLUSH_INTERVAL, self.IDLE_TIMEOUT, self.PACKET_COUNT_THRESHOLD,
+                "[FlowTracker] Started (learn=%dpkts, monitor_interval=%ss, flush=%ss, idle=%ss)",
+                self.LEARNING_PACKETS, self.MONITOR_INTERVAL,
+                self.FLUSH_INTERVAL, self.IDLE_TIMEOUT,
             )
 
     def stop(self):
@@ -228,7 +263,15 @@ class FlowTracker:
 
     def _process_ip(self, msg: StructuredMessage) -> None:
         """
-        从 IP StructuredMessage 提取五元组并聚合特征。
+        从 IP StructuredMessage 提取五元组，经采样门控后聚合特征。
+
+        采样策略（控制器侧实现，借鉴 sFlow 统计采样思想）：
+          - 新流: 创建 FlowFeatures，接受首包
+          - 学习阶段 (packet_count < LEARNING_PACKETS): 全量接受
+          - 监控阶段 (packet_count ≥ LEARNING_PACKETS): 每 MONITOR_INTERVAL 秒
+            最多接受 1 个包（控制负载）
+          - 学习阶段完成 → 立即输出分类结果（但不删除流，进入监控）
+          - 被采样门拒绝的包: 静默丢弃，不消耗 CPU/内存
 
         仅处理 IPv4 TCP/UDP 包（流特征需要端口信息）。
         """
@@ -268,6 +311,7 @@ class FlowTracker:
         with self._flows_lock:
             feats = self._flows.get(flow_key)
             if feats is None:
+                # ── 新流：创建并接受首包 ──
                 feats = FlowFeatures(
                     flow_key=flow_key,
                     src_ip=src_ip,
@@ -280,27 +324,40 @@ class FlowTracker:
                 )
                 self._flows[flow_key] = feats
             else:
-                feats.update(len(raw), arrival_time)
+                # ── 采样门控 ──
+                if feats.packet_count < self.LEARNING_PACKETS:
+                    # 学习阶段：全量接受（快速建立流特征）
+                    feats.update(len(raw), arrival_time)
 
-            # 包数达到阈值 → 立即输出
-            if feats.packet_count >= self.PACKET_COUNT_THRESHOLD:
-                self._output_flow(feats)
-                del self._flows[flow_key]
+                    # 学习阶段完成 → 立即输出分类结果
+                    if feats.packet_count == self.LEARNING_PACKETS:
+                        self._output_flow(feats)
+                        # 不删除流，进入监控阶段
+                else:
+                    # 监控阶段：定期采样（控制负载，借鉴 sFlow 统计采样思想）
+                    elapsed = arrival_time - feats._last_sample_time
+                    if elapsed < self.MONITOR_INTERVAL:
+                        return  # 采样门拒绝：距上次采样不足 MONITOR_INTERVAL
+                    feats._last_sample_time = arrival_time
+                    feats.update(len(raw), arrival_time)
 
     # ──────────────────────────────────────────────
     #  流输出
     # ──────────────────────────────────────────────
 
     def _flush_completed_flows(self) -> None:
-        """输出所有已达包数阈值的流（已在 _process_ip 中即时输出，此处兜底）。"""
+        """
+        定期重输出监控阶段的流（有新采样数据且距上次输出有增量）。
+
+        学习阶段完成时已在 _process_ip 中即时输出，此处负责：
+          - 监控阶段流如果有新采样 (packet_count > _last_output_count)
+            → 重新输出，更新分类特征
+        """
         with self._flows_lock:
-            to_flush = [
-                f for f in self._flows.values()
-                if f.packet_count >= self.PACKET_COUNT_THRESHOLD
-            ]
-            for feats in to_flush:
-                self._output_flow(feats)
-                del self._flows[feats.flow_key]
+            for feats in list(self._flows.values()):
+                if feats.packet_count > self.LEARNING_PACKETS:
+                    if feats.packet_count > feats._last_output_count:
+                        self._output_flow(feats)
 
     def _expire_idle_flows(self, now: float) -> None:
         """清理并输出空闲流。"""
@@ -315,8 +372,9 @@ class FlowTracker:
                 self._total_flows_expired += 1
 
     def _output_flow(self, feats: FlowFeatures) -> None:
-        """输出单条流特征（通过回调）。"""
+        """输出单条流特征（通过回调），记录输出计数避免立即重复输出。"""
         self._total_flows_output += 1
+        feats._last_output_count = feats.packet_count
         if self._on_flow_flush:
             try:
                 self._on_flow_flush([feats])
@@ -380,45 +438,94 @@ if __name__ == "__main__":
 
     tracker.set_on_flow_flush(_on_flush)
 
+    import time as _time
+
     # ── 测试 1：构造 ──
     assert tracker is not None
     errors.append("✓ FlowTracker 构造")
 
-    # ── 测试 2：单包处理 ──
+    # ── 测试 2：新流创建 ──
+    now = _time.time()
     pkt = _make_ip_packet("10.0.0.1", "10.0.0.2", IP_PROTO_TCP, 12345, 80)
     msg = StructuredMessage(
-        msg_type=StructuredMessage.TYPE_IP,
+        msg_type=StructuredMessage.TYPE_MIRROR,
         dpid=1, in_port=1,
         data=pkt, ethertype=0x0800,
         src_mac="aa:bb:cc:dd:ee:01",
         dst_mac="aa:bb:cc:dd:ee:02",
     )
-    q.put(msg)
-    # 自测直接调用内部方法验证处理逻辑
     tracker._process_ip(msg)
     assert tracker._total_ips == 1
     assert len(tracker._flows) == 1
-    errors.append("✓ 单包处理")
+    errors.append("✓ 新流创建")
 
-    # ── 测试 3：流聚合 ──
-    for _ in range(10):
-        pkt2 = _make_ip_packet("10.0.0.1", "10.0.0.2", IP_PROTO_TCP, 12345, 80)
-        msg2 = StructuredMessage(
-            msg_type=StructuredMessage.TYPE_IP,
+    # ── 测试 3：学习阶段 — 全量接受前 LEARNING_PACKETS 个包 ──
+    for i in range(tracker.LEARNING_PACKETS - 1):  # 已处理 1 包，再补 19 包
+        pkt_i = _make_ip_packet("10.0.0.1", "10.0.0.2", IP_PROTO_TCP, 12345, 80)
+        msg_i = StructuredMessage(
+            msg_type=StructuredMessage.TYPE_MIRROR,
             dpid=1, in_port=1,
-            data=pkt2, ethertype=0x0800,
+            data=pkt_i, ethertype=0x0800,
             src_mac="aa:bb:cc:dd:ee:01",
             dst_mac="aa:bb:cc:dd:ee:02",
+            timestamp=now + i * 0.01,
         )
-        tracker._process_ip(msg2)
+        tracker._process_ip(msg_i)
     feats = list(tracker._flows.values())[0]
-    assert feats.packet_count == 11
-    errors.append(f"✓ 流聚合 (pkt_count={feats.packet_count})")
+    assert feats.packet_count == tracker.LEARNING_PACKETS, \
+        f"学习阶段应全量接受: expected={tracker.LEARNING_PACKETS}, got={feats.packet_count}"
+    errors.append(f"✓ 学习阶段全量接受 (pkt_count={feats.packet_count})")
 
-    # ── 测试 4：不同流隔离 ──
+    # ── 测试 4：学习阶段完成 → 立即输出 ──
+    assert len(captured) == 1, f"学习阶段完成应输出 1 次: got {len(captured)}"
+    assert captured[0].packet_count == tracker.LEARNING_PACKETS
+    errors.append(f"✓ 学习阶段完成即输出 (output_count={len(captured)})")
+
+    # ── 测试 5：监控阶段 — 采样门拒绝间隔不足的包 ──
+    before_pkt_count = feats.packet_count
+    # 发送一个"当前时间"的包（MONITOR_INTERVAL 内）→ 应被拒绝
+    pkt_mon = _make_ip_packet("10.0.0.1", "10.0.0.2", IP_PROTO_TCP, 12345, 80)
+    msg_mon = StructuredMessage(
+        msg_type=StructuredMessage.TYPE_MIRROR,
+        dpid=1, in_port=1,
+        data=pkt_mon, ethertype=0x0800,
+        src_mac="aa:bb:cc:dd:ee:01",
+        dst_mac="aa:bb:cc:dd:ee:02",
+        timestamp=now + tracker.LEARNING_PACKETS * 0.01 + 0.1,  # 仅 0.1s 后
+    )
+    tracker._process_ip(msg_mon)
+    assert feats.packet_count == before_pkt_count, \
+        f"监控阶段间隔不足应被拒绝: expected={before_pkt_count}, got={feats.packet_count}"
+    errors.append("✓ 监控阶段间隔不足拒绝")
+
+    # ── 测试 6：监控阶段 — 接受间隔足够的采样包 ──
+    pkt_mon2 = _make_ip_packet("10.0.0.1", "10.0.0.2", IP_PROTO_TCP, 12345, 80)
+    msg_mon2 = StructuredMessage(
+        msg_type=StructuredMessage.TYPE_MIRROR,
+        dpid=1, in_port=1,
+        data=pkt_mon2, ethertype=0x0800,
+        src_mac="aa:bb:cc:dd:ee:01",
+        dst_mac="aa:bb:cc:dd:ee:02",
+        timestamp=now + tracker.LEARNING_PACKETS * 0.01 + tracker.MONITOR_INTERVAL + 0.1,
+    )
+    tracker._process_ip(msg_mon2)
+    assert feats.packet_count == before_pkt_count + 1, \
+        f"监控阶段间隔足够应接受: expected={before_pkt_count + 1}, got={feats.packet_count}"
+    errors.append("✓ 监控阶段间隔足够接受")
+
+    # ── 测试 7：监控阶段 _flush_completed_flows 重输出 ──
+    captured_before = len(captured)
+    # 修改 _last_output_count 模拟上次已输出
+    feats._last_output_count = feats.packet_count - 1
+    tracker._flush_completed_flows()
+    assert len(captured) == captured_before + 1, \
+        f"监控阶段有新采样应重输出: expected={captured_before + 1}, got={len(captured)}"
+    errors.append("✓ 监控阶段定期重输出")
+
+    # ── 测试 8：不同流隔离 ──
     pkt3 = _make_ip_packet("10.0.0.3", "10.0.0.4", IP_PROTO_UDP, 53, 9999)
     msg3 = StructuredMessage(
-        msg_type=StructuredMessage.TYPE_IP,
+        msg_type=StructuredMessage.TYPE_MIRROR,
         dpid=2, in_port=2,
         data=pkt3, ethertype=0x0800,
         src_mac="aa:bb:cc:dd:ee:03",
@@ -428,17 +535,17 @@ if __name__ == "__main__":
     assert len(tracker._flows) == 2
     errors.append(f"✓ 不同流隔离 ({len(tracker._flows)} flows)")
 
-    # ── 测试 5：特征字典 ──
+    # ── 测试 9：特征字典 ──
     d = feats.to_dict()
     assert d["src_ip"] == "10.0.0.1"
     assert d["dst_port"] == 80
     assert d["protocol"] == IP_PROTO_TCP
     errors.append("✓ to_dict")
 
-    # ── 测试 6：IP 包过滤（协议非 TCP/UDP） ──
+    # ── 测试 10：IP 包过滤（协议非 TCP/UDP） ──
     pkt4 = _make_ip_packet("10.0.0.1", "10.0.0.2", 1, 0, 0)  # ICMP
     msg4 = StructuredMessage(
-        msg_type=StructuredMessage.TYPE_IP,
+        msg_type=StructuredMessage.TYPE_MIRROR,
         dpid=1, in_port=1,
         data=pkt4, ethertype=0x0800,
         src_mac="aa:bb:cc:dd:ee:01",
@@ -450,19 +557,19 @@ if __name__ == "__main__":
     assert before == after, f"ICMP 不应创建流 (before={before}, after={after})"
     errors.append("✓ ICMP 包过滤")
 
-    # ── 测试 7：空闲流过期 ──
-    # 将首个流的 last_seen 设置为很久以前
+    # ── 测试 11：空闲流过期 ──
     with tracker._flows_lock:
         for f in tracker._flows.values():
             if f.src_ip == "10.0.0.1":
                 f.last_seen = 0.0  # 模拟超时
-    tracker._expire_idle_flows(time.time())
+    tracker._expire_idle_flows(_time.time() + 100)
     assert len(tracker._flows) == 1  # 仅剩 10.0.0.3 的 UDP 流
-    errors.append(f"✓ 空闲流过期 ({len(captured)} flushed)")
+    errors.append(f"✓ 空闲流过期 ({len(captured)} total outputs)")
 
-    # ── 测试 8：统计 ──
+    # ── 测试 12：统计 ──
     s = tracker.stats()
     assert s["active_flows"] >= 0
+    assert s["total_ips"] > 0
     errors.append("✓ stats")
 
     print("\n".join(errors))

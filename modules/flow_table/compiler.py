@@ -163,7 +163,10 @@ def compile_path_rules(  # type: ignore[reportUnknownParameterType]
             in_port = _find_in_port(links, prev_dpid, sw_dpid)
 
         match = _build_match(in_port)
-        actions: List[Dict[str, Any]] = [{"type": "OUTPUT", "port": out_port}]
+        actions: List[Dict[str, Any]] = [
+            {"type": "OUTPUT", "port": out_port},                          # 正常转发
+            {"type": "OUTPUT", "port": "OFPP_CONTROLLER", "max_len": 128}, # 镜像包头到控制器（流量分类采样）
+        ]
 
         rule = FlowRule(
             rule_id=f"{rule_prefix}_{src_dpid}_{dst_dpid}_hop{i}",
@@ -189,7 +192,10 @@ def compile_path_rules(  # type: ignore[reportUnknownParameterType]
             last_in_port = first_hop_in_port
 
         last_match = _build_match(last_in_port)
-        last_actions: List[Dict[str, Any]] = [{"type": "OUTPUT", "port": dst_host_port}]
+        last_actions: List[Dict[str, Any]] = [
+            {"type": "OUTPUT", "port": dst_host_port},                    # 正常转发到主机
+            {"type": "OUTPUT", "port": "OFPP_CONTROLLER", "max_len": 128}, # 镜像包头到控制器（流量分类采样）
+        ]
 
         last_rule = FlowRule(
             rule_id=f"{rule_prefix}_{src_dpid}_{dst_dpid}_hop{len(path)-1}",

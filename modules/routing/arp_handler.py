@@ -508,7 +508,10 @@ class ArpHandler:
                 "eth_src": src_host.mac,
                 "eth_dst": dst_host.mac,
             },
-            actions=[{"type": "OUTPUT", "port": dst_host.port}],
+            actions=[
+                {"type": "OUTPUT", "port": dst_host.port},                    # 正常转发到主机
+                {"type": "OUTPUT", "port": "OFPP_CONTROLLER", "max_len": 128}, # 镜像包头到控制器（流量分类采样）
+            ],
         )
 
         deployed, _ = self._flow_deployer.deploy_rules([rule], remove_old=False)
