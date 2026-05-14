@@ -200,6 +200,7 @@ class ArpHandler:
         if count > 0 and self._topology_graph:
             from modules.flow_table.compiler import (
                 compile_path_rules,
+                compile_p0_rules,
                 PRIORITY_PRIMARY,
             )
 
@@ -230,34 +231,57 @@ class ArpHandler:
                         skipped += 1
                         continue
 
-                    if route.get("is_p0"):
+                    is_p0 = route.get("is_p0", False)
+                    if is_p0:
                         primary = route["p0"]["primary"]
+                        backup = route["p0"].get("backup")
                     else:
                         primary = route["p1"]["primary"]
+                        backup = None
 
                     if primary is None or not primary.path:
                         skipped += 1
                         continue
 
-                    rules = compile_path_rules(
-                        path=primary.path,
-                        graph=graph,
-                        src_dpid=src_host.dpid,
-                        dst_dpid=dst_host.dpid,
-                        src_mac=src_host.mac,
-                        dst_mac=dst_host.mac,
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        first_hop_in_port=src_host.port,
-                        dst_host_port=dst_host.port,
-                        priority=PRIORITY_PRIMARY,
-                        rule_prefix="arp_flow",
-                    )
-
-                    # remove_old=False：硬件已在步骤 1 全量清除
-                    deployed, _ = self._flow_deployer.deploy_rules(
-                        rules, remove_old=False,
-                    )
+                    if is_p0 and backup is not None and backup.path:
+                        # P0 双路径下发：主路径 + 备路径
+                        primary_rules, backup_rules = compile_p0_rules(
+                            primary_path=primary.path,
+                            backup_path=backup.path,
+                            graph=graph,
+                            src_dpid=src_host.dpid,
+                            dst_dpid=dst_host.dpid,
+                            src_mac=src_host.mac,
+                            dst_mac=dst_host.mac,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            first_hop_in_port=src_host.port,
+                            dst_host_port=dst_host.port,
+                        )
+                        # remove_old=False：硬件已在步骤 1 全量清除
+                        deployed, _ = self._flow_deployer.deploy_p0_paths(
+                            primary_rules, backup_rules,
+                        )
+                    else:
+                        # P1 或 P0 无备路径：单路径下发
+                        rules = compile_path_rules(
+                            path=primary.path,
+                            graph=graph,
+                            src_dpid=src_host.dpid,
+                            dst_dpid=dst_host.dpid,
+                            src_mac=src_host.mac,
+                            dst_mac=dst_host.mac,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            first_hop_in_port=src_host.port,
+                            dst_host_port=dst_host.port,
+                            priority=PRIORITY_PRIMARY,
+                            rule_prefix="arp_flow",
+                        )
+                        # remove_old=False：硬件已在步骤 1 全量清除
+                        deployed, _ = self._flow_deployer.deploy_rules(
+                            rules, remove_old=False,
+                        )
                     self._total_flows_deployed += deployed
 
                     with self._deployed_lock:
@@ -673,6 +697,7 @@ class ArpHandler:
         try:
             from modules.flow_table.compiler import (
                 compile_path_rules,
+                compile_p0_rules,
                 PRIORITY_PRIMARY,
             )
 
@@ -693,47 +718,80 @@ class ArpHandler:
                 graph = self._topology_graph.get_full()
 
             # 确定使用 P0 主路径还是 P1 主路径
-            if route.get("is_p0"):
+            is_p0 = route.get("is_p0", False)
+            if is_p0:
                 primary = route["p0"]["primary"]
+                backup = route["p0"].get("backup")
             else:
                 primary = route["p1"]["primary"]
+                backup = None
 
             if primary is None or not primary.path:
                 return False
 
-            # 编译 Phase 2 流表
-            rules = compile_path_rules(
-                path=primary.path,
-                graph=graph,
-                src_dpid=src_host.dpid,
-                dst_dpid=dst_host.dpid,
-                src_mac=src_host.mac,
-                dst_mac=dst_host.mac,
-                src_ip=src_ip,
-                dst_ip=dst_ip,
-                first_hop_in_port=src_host.port,
-                dst_host_port=dst_host.port,
-                priority=PRIORITY_PRIMARY,
-                rule_prefix="arp_flow",
-            )
+            deployed = 0
+            if is_p0 and backup is not None and backup.path:
+                # P0 双路径下发：主路径 + 备路径
+                primary_rules, backup_rules = compile_p0_rules(
+                    primary_path=primary.path,
+                    backup_path=backup.path,
+                    graph=graph,
+                    src_dpid=src_host.dpid,
+                    dst_dpid=dst_host.dpid,
+                    src_mac=src_host.mac,
+                    dst_mac=dst_host.mac,
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    first_hop_in_port=src_host.port,
+                    dst_host_port=dst_host.port,
+                )
+                deployed, failed = self._flow_deployer.deploy_p0_paths(
+                    primary_rules, backup_rules,
+                )
+                self._total_flows_deployed += deployed
 
-            # remove_old=True：删除 Phase 1 cookie 标记的旧规则，写入 Phase 2 规则
-            deployed, failed = self._flow_deployer.deploy_rules(
-                rules, remove_old=True,
-            )
-            self._total_flows_deployed += deployed
+                if deployed > 0:
+                    self.logger.info(
+                        f"[ArpHandler] Phase 2 (P0 dual-path, profile={profile}): "
+                        f"{src_ip}({src_host.mac}) → {dst_ip}({dst_host.mac}) | "
+                        f"primary={primary.path} U={primary.utility:.4f} | "
+                        f"backup={backup.path} U={backup.utility:.4f} | "
+                        f"{deployed} rules"
+                    )
+            else:
+                # P1 或 P0 无备路径：单路径下发
+                rules = compile_path_rules(
+                    path=primary.path,
+                    graph=graph,
+                    src_dpid=src_host.dpid,
+                    dst_dpid=dst_host.dpid,
+                    src_mac=src_host.mac,
+                    dst_mac=dst_host.mac,
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    first_hop_in_port=src_host.port,
+                    dst_host_port=dst_host.port,
+                    priority=PRIORITY_PRIMARY,
+                    rule_prefix="arp_flow",
+                )
+                # remove_old=True：删除 Phase 1 cookie 标记的旧规则，写入 Phase 2 规则
+                deployed, failed = self._flow_deployer.deploy_rules(
+                    rules, remove_old=True,
+                )
+                self._total_flows_deployed += deployed
+
+                if deployed > 0:
+                    self.logger.info(
+                        f"[ArpHandler] Phase 2 (KSP+QoS, profile={profile}): "
+                        f"{src_ip}({src_host.mac}) → {dst_ip}({dst_host.mac}) | "
+                        f"path={primary.path} | U={primary.utility:.4f} | "
+                        f"{deployed} rules"
+                    )
 
             # 标记为分类完成后的最终流表（存储实际 profile）
             with self._deployed_lock:
                 self._deployed_flows[flow_key] = profile
 
-            if deployed > 0:
-                self.logger.info(
-                    f"[ArpHandler] Phase 2 (KSP+QoS, profile={profile}): "
-                    f"{src_ip}({src_host.mac}) → {dst_ip}({dst_host.mac}) | "
-                    f"path={primary.path} | U={primary.utility:.4f} | "
-                    f"{deployed} rules"
-                )
             return deployed > 0
 
         except Exception:
