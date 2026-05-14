@@ -26,9 +26,17 @@ if TYPE_CHECKING:
     from queue import Queue
 
 
+def _mac_bytes_to_str(mac_bytes: bytes) -> str:
+    """6 字节 MAC → 'xx:xx:xx:xx:xx:xx'"""
+    return ":".join(f"{b:02x}" for b in mac_bytes)
+
+
 class StructuredMessage:
     """
     标准化消息对象 — Worker 输出的数据结构
+
+    Worker 一次解析，消费者复用：ethertype / src_mac / dst_mac 由 Worker
+    在 _handle_one() 中从以太网帧头提取并注入，下游消费者无需重复 struct.unpack。
     """
     TYPE_LLDP = "LLDP"
     TYPE_ARP = "ARP"
@@ -36,12 +44,17 @@ class StructuredMessage:
     TYPE_OTHER = "OTHER"
 
     def __init__(self, msg_type: str, dpid: int, in_port: int,
-                 data: bytes, timestamp: Optional[float] = None):
+                 data: bytes, timestamp: Optional[float] = None,
+                 ethertype: int = 0, src_mac: str = "", dst_mac: str = ""):
         self.msg_type = msg_type
         self.dpid = dpid
         self.in_port = in_port
         self.data = data
         self.timestamp = timestamp or time.time()
+        # Worker 预解析字段（避免下游重复 struct.unpack）
+        self.ethertype = ethertype      # EtherType 整数（0x0800, 0x0806, 0x88CC）
+        self.src_mac = src_mac          # 源 MAC（格式化字符串 "xx:xx:xx:xx:xx:xx"）
+        self.dst_mac = dst_mac          # 目标 MAC（格式化字符串）
 
     def __repr__(self):
         return (f"StructuredMessage(type={self.msg_type}, "
@@ -255,12 +268,19 @@ class Worker:
         except Exception:
             in_port = 0
 
-        # 4. 数据结构化
+        # 4. 预解析以太网帧头（一次提取，下游消费者复用，消除重复 struct.unpack）
+        src_mac = _mac_bytes_to_str(raw_data[6:12]) if len(raw_data) >= 14 else ""
+        dst_mac = _mac_bytes_to_str(raw_data[0:6]) if len(raw_data) >= 14 else ""
+
+        # 5. 数据结构化
         structured = StructuredMessage(
             msg_type=msg_type,
             dpid=dpid,
             in_port=in_port,
             data=raw_data,
+            ethertype=ethertype,
+            src_mac=src_mac,
+            dst_mac=dst_mac,
         )
 
         # 5. 按类型路由到输出队列

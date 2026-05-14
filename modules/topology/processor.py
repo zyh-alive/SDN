@@ -650,8 +650,8 @@ class TopologyProcessor:
         if not raw_data:
             return None
 
-        # 1. 解析 LLDP 包
-        lldp_packet = parse_lldp_frame(raw_data)
+        # 1. 解析 LLDP 包（传入预解析 ethertype，消除重复 struct.unpack）
+        lldp_packet = parse_lldp_frame(raw_data, ethertype=structured_msg.ethertype)
         if lldp_packet is None:
             self._total_lldp_invalid += 1
             return None

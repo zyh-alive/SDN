@@ -227,23 +227,21 @@ class PerformanceMonitor:
         调用 MetricsCalculator.record_lldp_recv() 记录时延和丢包率接收计数。
         """
         from modules.message_queue.worker import StructuredMessage
-        from modules.topology.lldp_utils import parse_lldp_frame, LLDP_ETHERTYPE
-        import struct
+        from modules.topology.lldp_utils import parse_lldp_frame
+
+        # Worker 已做 EtherType 分类，直接复用 msg_type 和预解析 ethertype（消除重复 struct.unpack）
+        if structured_msg.msg_type != StructuredMessage.TYPE_LLDP:
+            return
 
         raw_data = structured_msg.data
         if not raw_data or len(raw_data) < 14:
             return
 
-        # 校验 ethertype
-        ethertype = struct.unpack("!H", raw_data[12:14])[0]
-        if ethertype != LLDP_ETHERTYPE:
-            return
-
         dst_dpid = structured_msg.dpid
         dst_port = structured_msg.in_port
 
-        # 解析 LLDP 帧获取 src 信息
-        lldp_pkt = parse_lldp_frame(raw_data)
+        # 解析 LLDP 帧获取 src 信息（传入预解析 ethertype，跳过重复 struct.unpack）
+        lldp_pkt = parse_lldp_frame(raw_data, ethertype=structured_msg.ethertype)
         if lldp_pkt is None:
             return
 

@@ -223,12 +223,8 @@ class ArpHandler:
         if len(raw) < ETH_HDR_LEN + ARP_HDR_LEN:
             return
 
-        # 解析以太网头
-        eth_src = _mac_bytes_to_str(raw[6:12])
-        ethertype = struct.unpack("!H", raw[12:14])[0]
-
-        if ethertype != ETH_TYPE_ARP:
-            return
+        # 以太网头已由 Worker 预解析，直接复用（消除重复 struct.unpack）
+        eth_src = msg.src_mac
 
         # 解析 ARP 头
         arp_offset = ETH_HDR_LEN
@@ -347,12 +343,8 @@ class ArpHandler:
         if len(raw) < ETH_HDR_LEN + IP_HDR_MIN_LEN:
             return
 
-        # 解析以太网头
-        eth_src = _mac_bytes_to_str(raw[6:12])
-        ethertype = struct.unpack("!H", raw[12:14])[0]
-
-        if ethertype != ETH_TYPE_IP:
-            return
+        # 以太网头已由 Worker 预解析，直接复用（消除重复 struct.unpack）
+        eth_src = msg.src_mac
 
         # 解析 IP 头
         ip_offset = ETH_HDR_LEN

@@ -226,7 +226,8 @@ def _parse_tlv(raw: bytes, offset: int) -> Tuple[int, int, bytes]:
     return tlv_type, length, value
 
 
-def parse_lldp_frame(raw_data: bytes) -> Optional[LLDPPacket]:
+def parse_lldp_frame(raw_data: bytes,
+                     ethertype: Optional[int] = None) -> Optional[LLDPPacket]:
     """
     解析 LLDP 以太网帧
 
@@ -235,6 +236,7 @@ def parse_lldp_frame(raw_data: bytes) -> Optional[LLDPPacket]:
 
     Args:
         raw_data: 原始数据包字节
+        ethertype: 预解析的 EtherType（由 Worker 提供），传入则跳过 struct.unpack
 
     Returns:
         LLDPPacket 或 None（解析失败）
@@ -242,10 +244,9 @@ def parse_lldp_frame(raw_data: bytes) -> Optional[LLDPPacket]:
     if len(raw_data) < 14:
         return None
 
-    # 验证 ethertype
-    ethertype = struct.unpack("!H", raw_data[12:14])[0] #!H 表示网络字节序的无符号短整数[12:14] 
-    #是以太网帧头中的 ethertype 字段,[0]表示取 unpack 返回的元组中的第一个元素，即 ethertype 的值
-    #unpack 将字节数据转换为 Python 数据类型，!H 表示网络字节序的无符号短整数（2 字节）
+    # 验证 ethertype（优先使用调用方预解析的值，消除重复 struct.unpack）
+    if ethertype is None:
+        ethertype = struct.unpack("!H", raw_data[12:14])[0]
     if ethertype != LLDP_ETHERTYPE:
         return None
 
