@@ -300,6 +300,31 @@ class SDNController(app_manager.RyuApp):
                             flow_key, result["type"],
                             result["confidence"], result["is_pseudo"],
                         )
+
+                    # ── 两阶段流表下发 Phase 2：分类完成 → KSP+QoS 重下发 ──
+                    # 仅当 is_pseudo=False（真实分类）或冷启动伪标签时也触发
+                    # （伪标签基于端口推断，比 uniform Dijkstra 更有区分度）
+                    try:
+                        # flow_key 格式: "src_ip:dst_ip:protocol:src_port:dst_port"
+                        parts = flow_key.split(":")
+                        if len(parts) >= 2:
+                            src_ip = parts[0]
+                            dst_ip = parts[1]
+                            profile = result["type"]
+                            if hasattr(self, 'arp_handler') and self.arp_handler:
+                                ok = self.arp_handler._redeploy_with_profile(
+                                    src_ip, dst_ip, profile,
+                                )
+                                if ok and self.logger:
+                                    self.logger.info(
+                                        "[Phase 2] Redeployed with profile=%s for "
+                                        "%s→%s", profile, src_ip, dst_ip,
+                                    )
+                    except Exception:
+                        if self.logger:
+                            self.logger.exception(
+                                "[Phase 2] Failed to trigger redeploy for %s", flow_key,
+                            )
                 except Exception:
                     if self.logger:
                         self.logger.exception("[Classifier] predict/write failed")

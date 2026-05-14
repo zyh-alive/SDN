@@ -117,6 +117,34 @@ def _filter_disjunction(
 # 公开 API
 # ──────────────────────────────────────────────
 
+def dijkstra_shortest_path(
+    graph: Dict[str, Any],
+    src: int,
+    dst: int,
+) -> Optional[List[int]]:
+    """标准 Dijkstra 最短路径（uniform weight=1，等价于 BFS）。
+
+    用于两阶段流表下发的 Phase 1：首包触发时快速计算一条最短路径，
+    先下发临时流表让流量通起来，等分类结果出来后 Phase 2 再用 KSP+QoS 重算。
+
+    Args:
+        graph: 拓扑图谱（TopologyGraph.to_dict() 格式）
+        src:   源交换机 DPID（整数）
+        dst:   目的交换机 DPID（整数）
+
+    Returns:
+        最短路径 DPID 序列 [src, ..., dst]，无路径时返回 None。
+
+    Example:
+        >>> path = dijkstra_shortest_path(graph, src=1, dst=4)
+        >>> print(" → ".join(hex(n) for n in path))
+    """
+    adj = _build_adjacency(graph)
+    if src not in adj or dst not in adj:
+        return None
+    return _dijkstra(adj, src, dst, set(), set())
+
+
 def yen_ksp(
     graph: Dict[str, Any],
     src: int,

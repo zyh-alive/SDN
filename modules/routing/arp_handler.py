@@ -101,8 +101,10 @@ class ArpHandler:
         self._ip_table: Dict[str, str] = {}
         self._table_lock = threading.Lock()
 
-        # 已下发流表的 (src_ip, dst_ip) 集合（避免重复下发）
-        self._deployed_flows: Set[Tuple[str, str]] = set()
+        # 已下发流表的 (src_ip, dst_ip) 字典（两阶段流表下发）
+        #   值: "phase1" = Dijkstra 临时流表（等待分类结果）
+        #       "phase2" = KSP+QoS 最终流表（分类后最优路径）
+        self._deployed_flows: Dict[Tuple[str, str], str] = {}
         self._deployed_lock = threading.Lock()
 
         # ARP 泛洪去重：{(src_ip, target_ip, dpid): last_flood_time}
@@ -150,8 +152,9 @@ class ArpHandler:
         """
         清空已下发流表记录，拓扑变更时由 _on_routes_updated 回调调用。
 
-        清空后，下一次首包到达时 _try_deploy_flow() 会重新查询路由缓存
-        并重新下发流表（走新路径），同时旧规则通过 idle_timeout 自然老化。
+        清空后，下一次首包到达时 _try_deploy_flow() 会重新走 Phase 1
+        (Dijkstra) → Phase 2 (KSP+QoS) 两阶段下发流程，
+        同时旧规则通过 idle_timeout 自然老化。
 
         Returns:
             清空前缓存的流表对数量
@@ -162,7 +165,7 @@ class ArpHandler:
         if self.logger:
             self.logger.info(
                 "[ArpHandler] Cleared %d deployed flow records "
-                "(topology changed, will re-deploy on next packet)", count,
+                "(topology changed, will re-deploy two-phase on next packet)", count,
             )
         return count
 
@@ -388,14 +391,22 @@ class ArpHandler:
 
     def _try_deploy_flow(self, src_ip: str, dst_ip: str, msg: Optional[StructuredMessage] = None):
         """
-        当 src 和 dst 主机都已学习完毕时，查找路由并下发精确流表。
+        两阶段流表下发 — 解决分类与路由的鸡生蛋问题。
 
-        管線：
-          1. 从学习表查 src_host(dpid, port, mac) 和 dst_host(dpid, port, mac)
-          2. 如果 src_dpid == dst_dpid（同交换机），直接下发 L2 转发规则
-          3. 否则查 RouteManager 缓存 → 编译 compile_path_rules(带 MAC/IP/in_port)
-          4. FlowDeployer.deploy_rules() 下发
-          5. 将首包 PacketOut 到首跳交换机出端口（Bug 5 修复：原始包不再丢失）
+        Phase 1 (t=0, 首包触发):
+          - Dijkstra 最短路径（uniform weight=1, O(V+E) 极快）
+          - 下发临时流表（带 OFPP_CONTROLLER 镜像，供分类采样）
+          - 标记为 "phase1"，等待流量分类结果
+
+        Phase 2 (t<5ms, 分类完成后):
+          - _redeploy_with_profile() 被 _on_flow_flush 回调触发
+          - KSP + QoS 效用值精算 → 最优路径
+          - remove_old=True 替换 Phase 1 临时流表 → 标记为 "phase2"
+
+        时序保证:
+          - Phase 1 流表 idle_timeout=60s，即使分类永远不来也能自动老化
+          - Phase 2 在首次分类输出（首包即输出，LEARNING_PACKETS=1）后触发
+          - 同交换机场景直接走 L2 转发（无需路由），标记为 "phase2" 跳过 Phase 1
 
         Args:
             src_ip: 源 IP
@@ -404,13 +415,15 @@ class ArpHandler:
         """
         flow_key = (src_ip, dst_ip)
         with self._deployed_lock:
-            if flow_key in self._deployed_flows:
-                 # 流表已下发，但仍需转发当前包（可能是第一个 ICMP 包）
-                src_host = self._lookup_ip(src_ip)
-                dst_host = self._lookup_ip(dst_ip)
-                if src_host and dst_host:
-                    self._forward_first_packet(msg, src_host, dst_host=dst_host)
-                return
+            phase = self._deployed_flows.get(flow_key)
+        if phase is not None:
+            # 流表已下发（phase1 或 phase2），仅转发当前包
+            src_host = self._lookup_ip(src_ip)
+            dst_host = self._lookup_ip(dst_ip)
+            if src_host and dst_host:
+                self._forward_first_packet(msg, src_host, dst_host=dst_host)
+            return
+
         src_host = self._lookup_ip(src_ip)
         dst_host = self._lookup_ip(dst_ip)
 
@@ -425,92 +438,200 @@ class ArpHandler:
                 compile_path_rules,
                 PRIORITY_PRIMARY,
             )
+            from modules.routing.ksp import dijkstra_shortest_path
 
             if src_host.dpid == dst_host.dpid:
-                # 同交换机：下发单条 L2 转发规则
+                # 同交换机：无需路由，直接 L2 转发 → 标记 phase2
                 self._deploy_l2_rule(src_host, dst_host)
-            else:
-                # 跨交换机：查路由缓存
-                route = self._route_manager.get_route(
-                    src_host.dpid, dst_host.dpid, profile="realtime"
+                with self._deployed_lock:
+                    self._deployed_flows[flow_key] = "phase2"
+                self._forward_first_packet(msg, src_host, dst_host=dst_host)
+                return
+
+            # ── Phase 1: Dijkstra 最短路径（fast path） ──
+            graph: Dict[str, Any] = {}
+            if self._topology_graph:
+                graph = self._topology_graph.get_full()
+
+            # 确保路由缓存已填充（时序竞态：拓扑事件异步，可能晚于首包）
+            route = self._route_manager.get_route(
+                src_host.dpid, dst_host.dpid, profile="realtime"
+            )
+            if route is None:
+                self.logger.warning(
+                    f"[ArpHandler] Route cache miss for "
+                    f"{src_host.dpid}→{dst_host.dpid}, "
+                    f"triggering on-demand recompute..."
                 )
-                if route is None:
-                    # Bug 9 修复：路由缓存可能因时序竞态尚未填充
-                    # （拓扑事件通过 Redis Stream → StalkerManager 异步通知，
-                    #   防抖窗口 2-5s + XREADGROUP 超时 5s 导致
-                    #   路由重算延迟于 ARP/IP 首包到达）
-                    # 此时主动触发一次 recompute_all() 从内存图谱重算并重试
-                    self.logger.warning(
-                        f"[ArpHandler] Route cache miss for "
-                        f"{src_host.dpid}→{dst_host.dpid}, "
-                        f"triggering on-demand recompute..."
-                    )
-                    self._route_manager.recompute_all()
-                    route = self._route_manager.get_route(
-                        src_host.dpid, dst_host.dpid, profile="realtime"
-                    )
-                    if route is None:
-                        self.logger.error(
-                            f"[ArpHandler] Still no route after on-demand recompute "
-                            f"for {src_host.dpid}→{dst_host.dpid}"
-                        )
-                        return
+                self._route_manager.recompute_all()
 
-                # 获取拓扑图谱
-                graph: Dict[str, Any] = {}
-                if self._topology_graph:
-                    graph = self._topology_graph.get_full()
+            # Phase 1: 纯 Dijkstra（不区分 profile，不调用 KSP+QoS）
+            path = dijkstra_shortest_path(graph, src_host.dpid, dst_host.dpid)
+            if path is None:
+                self.logger.error(
+                    f"[ArpHandler] Phase 1 Dijkstra failed for "
+                    f"{src_host.dpid}→{dst_host.dpid}"
+                )
+                return
 
-                # 确定使用 P0 主路径还是 P1 主路径
-                if route.get("is_p0"):
-                    primary = route["p0"]["primary"]
-                else:
-                    primary = route["p1"]["primary"]
+            # 编译 Phase 1 流表（idle_timeout=60s，若分类结果永不回来则自动老化）
+            rules = compile_path_rules(
+                path=path,
+                graph=graph,
+                src_dpid=src_host.dpid,
+                dst_dpid=dst_host.dpid,
+                src_mac=src_host.mac,
+                dst_mac=dst_host.mac,
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                first_hop_in_port=src_host.port,
+                dst_host_port=dst_host.port,
+                priority=PRIORITY_PRIMARY,
+                rule_prefix="arp_flow",
+            )
 
-                if primary is None or not primary.path:
-                    return
-
-                # 编译带精确匹配字段的流表
-                rules = compile_path_rules(
-                    path=primary.path,
-                    graph=graph,
-                    src_dpid=src_host.dpid,
-                    dst_dpid=dst_host.dpid,
-                    src_mac=src_host.mac,
-                    dst_mac=dst_host.mac,
-                    src_ip=src_ip,
-                    dst_ip=dst_ip,
-                    first_hop_in_port=src_host.port,
-                    dst_host_port=dst_host.port,
-                    priority=PRIORITY_PRIMARY,
-                    rule_prefix="arp_flow",
+            # 下发 Phase 1（不删旧规则，因为是首次下发）
+            deployed, failed = self._flow_deployer.deploy_rules(
+                rules, remove_old=False,
+            )
+            self._total_flows_deployed += deployed
+            if deployed > 0:
+                self.logger.info(
+                    f"[ArpHandler] Phase 1 (Dijkstra): {src_ip}({src_host.mac}) "
+                    f"→ {dst_ip}({dst_host.mac}) | "
+                    f"path={path} | {deployed} rules"
                 )
 
-                # 下发（remove_old=True：重下发时先按 cookie 删除旧规则，再写新规则）
-                deployed, failed = self._flow_deployer.deploy_rules(
-                    rules, remove_old=True,
-                )
-                self._total_flows_deployed += deployed
-                if deployed > 0:
-                    self.logger.info(
-                        f"[ArpHandler] Flow deployed: {src_ip}({src_host.mac}) "
-                        f"→ {dst_ip}({dst_host.mac}) | "
-                        f"path={primary.path} | {deployed} rules"
-                    )
-
-            # Bug 5 修复：流表下发成功后立即 Forward 首包到首跳出端口
-            # Bug 12 修复：传入 dst_host 以支持同交换机首包转发
-            self._forward_first_packet(msg, src_host, dst_host=dst_host)
-
-            # 标记已下发
+            # 标记为 Phase 1（等待分类结果 → _redeploy_with_profile）
             with self._deployed_lock:
-                self._deployed_flows.add(flow_key)
+                self._deployed_flows[flow_key] = "phase1"
+
+            # 转发首包（Phase 1 流表已下发，传入 Dijkstra 路径避免二次查询）
+            self._forward_first_packet(msg, src_host, dst_host=dst_host, path=path)
 
         except Exception:
             if self.logger:
                 self.logger.exception(
-                    f"[ArpHandler] Failed to deploy flow for {src_ip}→{dst_ip}"
+                    f"[ArpHandler] Failed to deploy Phase 1 flow for {src_ip}→{dst_ip}"
                 )
+
+    def _redeploy_with_profile(self, src_ip: str, dst_ip: str, profile: str) -> bool:
+        """
+        Phase 2: 分类完成后用 KSP+QoS 重下发最优路径流表。
+
+        管線：
+          1. 查主机学习表 → src_host, dst_host
+          2. 查 RouteManager.get_route(profile) → 取 KSP+QoS 最优路径
+          3. 编译 compile_path_rules(带 MAC/IP/in_port)
+          4. deploy_rules(remove_old=True) 替换 Phase 1 规则
+          5. 标记为 "phase2"
+
+        Args:
+            src_ip:  源 IP
+            dst_ip:  目的 IP
+            profile: 分类结果 profile（realtime/interactive/streaming/bulk/other）
+
+        Returns:
+            True 如果 Phase 2 成功下发
+        """
+        flow_key = (src_ip, dst_ip)
+
+        # 仅当处于 phase1 时才执行 Phase 2（幂等保护）
+        with self._deployed_lock:
+            current_phase = self._deployed_flows.get(flow_key)
+        if current_phase != "phase1":
+            return False
+
+        src_host = self._lookup_ip(src_ip)
+        dst_host = self._lookup_ip(dst_ip)
+        if src_host is None or dst_host is None:
+            if self.logger:
+                self.logger.warning(
+                    f"[ArpHandler] Phase 2 skipped: host not found for "
+                    f"{src_ip}→{dst_ip}"
+                )
+            return False
+
+        if src_host.dpid == dst_host.dpid:
+            # 同交换机：已在 Phase 1 标记为 phase2，无需重下发
+            return True
+
+        if not self._route_manager or not self._flow_deployer:
+            return False
+
+        try:
+            from modules.flow_table.compiler import (
+                compile_path_rules,
+                PRIORITY_PRIMARY,
+            )
+
+            # 查 KSP+QoS 最优路径（按分类 profile）
+            route = self._route_manager.get_route(
+                src_host.dpid, dst_host.dpid, profile=profile
+            )
+            if route is None:
+                if self.logger:
+                    self.logger.error(
+                        f"[ArpHandler] Phase 2: No {profile} route for "
+                        f"{src_host.dpid}→{dst_host.dpid}"
+                    )
+                return False
+
+            graph: Dict[str, Any] = {}
+            if self._topology_graph:
+                graph = self._topology_graph.get_full()
+
+            # 确定使用 P0 主路径还是 P1 主路径
+            if route.get("is_p0"):
+                primary = route["p0"]["primary"]
+            else:
+                primary = route["p1"]["primary"]
+
+            if primary is None or not primary.path:
+                return False
+
+            # 编译 Phase 2 流表
+            rules = compile_path_rules(
+                path=primary.path,
+                graph=graph,
+                src_dpid=src_host.dpid,
+                dst_dpid=dst_host.dpid,
+                src_mac=src_host.mac,
+                dst_mac=dst_host.mac,
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                first_hop_in_port=src_host.port,
+                dst_host_port=dst_host.port,
+                priority=PRIORITY_PRIMARY,
+                rule_prefix="arp_flow",
+            )
+
+            # remove_old=True：删除 Phase 1 cookie 标记的旧规则，写入 Phase 2 规则
+            deployed, failed = self._flow_deployer.deploy_rules(
+                rules, remove_old=True,
+            )
+            self._total_flows_deployed += deployed
+
+            # 标记为 Phase 2（分类完成后的最终流表）
+            with self._deployed_lock:
+                self._deployed_flows[flow_key] = "phase2"
+
+            if deployed > 0:
+                self.logger.info(
+                    f"[ArpHandler] Phase 2 (KSP+QoS, profile={profile}): "
+                    f"{src_ip}({src_host.mac}) → {dst_ip}({dst_host.mac}) | "
+                    f"path={primary.path} | U={primary.utility:.4f} | "
+                    f"{deployed} rules"
+                )
+            return deployed > 0
+
+        except Exception:
+            if self.logger:
+                self.logger.exception(
+                    f"[ArpHandler] Phase 2 failed for {src_ip}→{dst_ip} "
+                    f"profile={profile}"
+                )
+            return False
 
     def _deploy_l2_rule(self, src_host: HostEntry, dst_host: HostEntry):
         """同交换机 L2 转发：下发精确匹配规则。"""
@@ -551,7 +672,8 @@ class ArpHandler:
     # ──────────────────────────────────────────────
 
     def _forward_first_packet(self, msg: Optional[StructuredMessage], src_host: HostEntry,
-                              dst_host: Optional[HostEntry] = None):
+                              dst_host: Optional[HostEntry] = None,
+                              path: Optional[List[int]] = None):
         """
         流表下发后将触发本次下发的首包通过 PacketOut 转发出去。
 
@@ -564,6 +686,16 @@ class ArpHandler:
         get_route(same, same) 返回 None → out_port 永远为 None → 首包被丢弃。
         
         修复：添加 dst_host 参数，同交换机时直接用 dst_host.port 作为 out_port。
+
+        两阶段流表下发适配：
+          - Phase 1 调用时传入 path=Dijkstra 路径，直接从路径计算 out_port
+          - 已下发流表场景（phase1/phase2），回退到 route_manager 查询
+
+        Args:
+            msg:      触发转发的原始消息
+            src_host: 源主机条目
+            dst_host: 目的主机条目（用于同交换机判断）
+            path:     可选路径（Phase 1 Dijkstra 时传入，避免二次查询）
         """
         if msg is None:
             return
@@ -583,8 +715,11 @@ class ArpHandler:
             # Bug 12: 同交换机场景直接使用 dst_host.port
             if dst_host is not None and src_host.dpid == dst_host.dpid:
                 out_port = dst_host.port
+            elif path is not None and len(path) >= 2:
+                # Phase 1: 直接从 Dijkstra 路径计算首跳出端口
+                out_port = _find_out_port(links, path[0], path[1])
             else:
-                # 跨交换机：从路由缓存中找路径的首跳出端口
+                # 已下发流表场景：从路由缓存中找路径的首跳出端口
                 route = self._route_manager.get_route(
                     src_host.dpid, self._lookup_dst_dpid(msg),
                     profile="realtime",

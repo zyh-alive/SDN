@@ -158,7 +158,7 @@ class FlowTracker:
     """
 
     # 采样控制
-    LEARNING_PACKETS = 20         # 学习阶段：首 N 包全量接受
+    LEARNING_PACKETS = 1          # 学习阶段：首包立即输出分类（两阶段流表下发 Phase 2 触发）
     MONITOR_INTERVAL = 5.0        # 监控阶段：每流最多 1 包/秒（s）
 
     # 流输出触发
@@ -323,6 +323,9 @@ class FlowTracker:
                     arrival_time=arrival_time,
                 )
                 self._flows[flow_key] = feats
+                # LEARNING_PACKETS=1 → 首包即输出（两阶段流表下发 Phase 2 触发）
+                if feats.packet_count == self.LEARNING_PACKETS:
+                    self._output_flow(feats)
             else:
                 # ── 采样门控 ──
                 if feats.packet_count < self.LEARNING_PACKETS:
@@ -459,18 +462,7 @@ if __name__ == "__main__":
     assert len(tracker._flows) == 1
     errors.append("✓ 新流创建")
 
-    # ── 测试 3：学习阶段 — 全量接受前 LEARNING_PACKETS 个包 ──
-    for i in range(tracker.LEARNING_PACKETS - 1):  # 已处理 1 包，再补 19 包
-        pkt_i = _make_ip_packet("10.0.0.1", "10.0.0.2", IP_PROTO_TCP, 12345, 80)
-        msg_i = StructuredMessage(
-            msg_type=StructuredMessage.TYPE_MIRROR,
-            dpid=1, in_port=1,
-            data=pkt_i, ethertype=0x0800,
-            src_mac="aa:bb:cc:dd:ee:01",
-            dst_mac="aa:bb:cc:dd:ee:02",
-            timestamp=now + i * 0.01,
-        )
-        tracker._process_ip(msg_i)
+    # ── 测试 3：学习阶段 — LEARNING_PACKETS=1 时首包即输出 ──
     feats = list(tracker._flows.values())[0]
     assert feats.packet_count == tracker.LEARNING_PACKETS, \
         f"学习阶段应全量接受: expected={tracker.LEARNING_PACKETS}, got={feats.packet_count}"
@@ -491,7 +483,7 @@ if __name__ == "__main__":
         data=pkt_mon, ethertype=0x0800,
         src_mac="aa:bb:cc:dd:ee:01",
         dst_mac="aa:bb:cc:dd:ee:02",
-        timestamp=now + tracker.LEARNING_PACKETS * 0.01 + 0.1,  # 仅 0.1s 后
+        timestamp=now + 0.1,  # 仅 0.1s 后
     )
     tracker._process_ip(msg_mon)
     assert feats.packet_count == before_pkt_count, \
@@ -506,7 +498,7 @@ if __name__ == "__main__":
         data=pkt_mon2, ethertype=0x0800,
         src_mac="aa:bb:cc:dd:ee:01",
         dst_mac="aa:bb:cc:dd:ee:02",
-        timestamp=now + tracker.LEARNING_PACKETS * 0.01 + tracker.MONITOR_INTERVAL + 0.1,
+        timestamp=now + tracker.MONITOR_INTERVAL + 0.1,
     )
     tracker._process_ip(msg_mon2)
     assert feats.packet_count == before_pkt_count + 1, \
