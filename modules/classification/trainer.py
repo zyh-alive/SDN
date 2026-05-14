@@ -40,6 +40,10 @@ class Trainer:
 
     从 MySQL flow_class_log 拉取数据 → 过滤 → 训练 Classifier。
 
+    冷启动策略:
+      - 第 1 次训练: 若真实标签不足，自动回退到伪标签数据（is_pseudo_label=1）
+      - 第 2+ 次训练: 仅使用真实标签（is_pseudo_label=0），确保模型持续改进
+
     Usage:
         trainer = Trainer(mysql_client=mysql_client, classifier=classifier, logger=...)
         trainer.start()
@@ -70,6 +74,9 @@ class Trainer:
         self._total_samples_pulled = 0
         self._last_train_time = 0.0
         self._lock = threading.Lock()
+
+        # 冷启动: 若从未成功训练，允许回退到伪标签数据
+        self._has_trained = False
 
     # ──────────────────────────────────────────────
     #  生命周期
@@ -134,6 +141,7 @@ class Trainer:
                 self._total_trainings += 1
                 self._total_samples_pulled += len(samples)
                 self._last_train_time = time.time()
+                self._has_trained = True  # 冷启动完成，后续用真标签
 
             if self.logger:
                 cls_counts: Dict[str, int] = {}
@@ -167,23 +175,45 @@ class Trainer:
             with self._mysql_client._engine.connect() as conn:
                 samples: List[Dict[str, Any]] = []
 
+                # ── 冷启动回退逻辑 ──
+                # 若从未成功训练过，先用伪标签数据完成首次训练
+                # 首次训练后 Classifier._is_trained = True → predict() 走真模型
+                # → 后续写入 is_pseudo_label = 0 → 第 2+ 次训练只用真标签
+                use_pseudo = not self._has_trained
+
                 for cls_name in CLASSES:
-                    query = sql_text("""
-                        SELECT protocol, src_port, dst_port,
-                               avg_packet_size, avg_iat
-                        FROM flow_class_log
-                        WHERE predicted_class = :cls
-                          AND is_pseudo_label = 0
-                          AND confidence >= :min_conf
-                          AND timestamp >= :since
-                        ORDER BY timestamp DESC
-                        LIMIT :limit
-                    """)
+                    if use_pseudo:
+                        # 冷启动: 拉取伪标签数据（confidence 门槛稍低，因为伪标签置信度低）
+                        query = sql_text("""
+                            SELECT protocol, src_port, dst_port,
+                                   avg_packet_size, avg_iat
+                            FROM flow_class_log
+                            WHERE predicted_class = :cls
+                              AND is_pseudo_label = 1
+                              AND confidence >= :min_conf
+                              AND timestamp >= :since
+                            ORDER BY timestamp DESC
+                            LIMIT :limit
+                        """)
+                    else:
+                        # 正常运行: 仅真实标签
+                        query = sql_text("""
+                            SELECT protocol, src_port, dst_port,
+                                   avg_packet_size, avg_iat
+                            FROM flow_class_log
+                            WHERE predicted_class = :cls
+                              AND is_pseudo_label = 0
+                              AND confidence >= :min_conf
+                              AND timestamp >= :since
+                            ORDER BY timestamp DESC
+                            LIMIT :limit
+                        """)
+
                     rows = conn.execute(
                         query,
                         {
                             "cls": cls_name,
-                            "min_conf": MIN_CONFIDENCE,
+                            "min_conf": 0.5 if use_pseudo else MIN_CONFIDENCE,
                             "since": datetime.utcnow() - timedelta(hours=SAMPLE_WINDOW_HOURS),
                             "limit": MAX_SAMPLES_PER_CLASS,
                         },
@@ -203,11 +233,18 @@ class Trainer:
 
                 if len(samples) < MIN_SAMPLES_FOR_TRAINING:
                     if self.logger:
+                        tag = "pseudo" if use_pseudo else "real"
                         self.logger.debug(
-                            "[Trainer] Insufficient samples: %d < %d, skipping training",
-                            len(samples), MIN_SAMPLES_FOR_TRAINING,
+                            "[Trainer] Insufficient %s samples: %d < %d, skipping",
+                            tag, len(samples), MIN_SAMPLES_FOR_TRAINING,
                         )
                     return []
+
+                if use_pseudo and self.logger:
+                    self.logger.info(
+                        "[Trainer] Cold-start mode: using %d pseudo-labeled samples "
+                        "for initial training", len(samples),
+                    )
 
                 return samples
 

@@ -146,6 +146,26 @@ class ArpHandler:
         if self._thread:
             self._thread.join(timeout=3.0)
 
+    def clear_deployed_flows(self) -> int:
+        """
+        清空已下发流表记录，拓扑变更时由 _on_routes_updated 回调调用。
+
+        清空后，下一次首包到达时 _try_deploy_flow() 会重新查询路由缓存
+        并重新下发流表（走新路径），同时旧规则通过 idle_timeout 自然老化。
+
+        Returns:
+            清空前缓存的流表对数量
+        """
+        with self._deployed_lock:
+            count = len(self._deployed_flows)
+            self._deployed_flows.clear()
+        if self.logger:
+            self.logger.info(
+                "[ArpHandler] Cleared %d deployed flow records "
+                "(topology changed, will re-deploy on next packet)", count,
+            )
+        return count
+
     # ──────────────────────────────────────────────
     #  主循环
     # ──────────────────────────────────────────────
@@ -466,9 +486,9 @@ class ArpHandler:
                     rule_prefix="arp_flow",
                 )
 
-                # 下发
+                # 下发（remove_old=True：重下发时先按 cookie 删除旧规则，再写新规则）
                 deployed, failed = self._flow_deployer.deploy_rules(
-                    rules, remove_old=False,
+                    rules, remove_old=True,
                 )
                 self._total_flows_deployed += deployed
                 if deployed > 0:

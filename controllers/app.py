@@ -733,3 +733,8 @@ class SDNController(app_manager.RyuApp):
             f"switches={summary.get('switches', 0)}). "
             f"Flow rules will be deployed on first packet by ArpHandler."
         )
+
+        # 清空 ArpHandler 的 _deployed_flows 记录，使已有通信对
+        # 在下次首包时重新查路由 → 走新路径（修复拓扑变更后流表不更新）
+        if hasattr(self, 'arp_handler') and self.arp_handler:
+            self.arp_handler.clear_deployed_flows()
