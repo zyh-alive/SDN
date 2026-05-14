@@ -120,8 +120,11 @@ class Dispatcher:
 
         raw_data = msg.data
         if raw_data:
-            # crc32 全包 hash（纳秒级，表驱动），比 Python hash() 在小模数下均匀得多
-            idx = (zlib.crc32(raw_data) ^ (dpid * 31 + in_port)) % self._num_workers
+            # crc32 全包 hash → 无符号 → 黄金比例乘法混合（bit 雪崩效应）
+            # 解决相似数据包（ARP 泛洪）的 crc32 低 bit 聚类问题
+            h = zlib.crc32(raw_data) & 0xFFFFFFFF
+            h = (h * 0x9E3779B9) & 0xFFFFFFFF  # 黄金比例素数，保证 bit 雪崩
+            idx = (h + dpid * 31 + in_port) % self._num_workers
         else:
             idx = hash((dpid, in_port)) % self._num_workers
         worker = self._workers[idx]
