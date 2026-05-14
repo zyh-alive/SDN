@@ -151,13 +151,17 @@ class ArpHandler:
     # ──────────────────────────────────────────────
 
     def _run_loop(self):
-        """从所有 west_queue 中阻塞消费消息。"""
+        """从共享 west_queue 中批量消费消息（单队列 + 批量排空）。"""
+        # 共享模式下只有一个队列，直接取引用避免每次循环索引
+        q = self._west_queues[0]
+
         while self._running:
-            for q in self._west_queues:
+            # 批量排空：用 get_nowait() 无阻塞地一次性取完所有消息
+            while True:
                 try:
-                    msg = q.get(timeout=0.5)
+                    msg = q.get_nowait()
                 except queue.Empty:
-                    continue
+                    break
                 try:
                     self._handle_message(msg)
                 except Exception:
@@ -168,7 +172,16 @@ class ArpHandler:
             self._clean_stale_entries()
             self._clean_flood_dedup()
 
-            time.sleep(0.01)
+            # 队列为空时短暂阻塞等待新消息，避免忙等
+            try:
+                msg = q.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            try:
+                self._handle_message(msg)
+            except Exception:
+                if self.logger:
+                    self.logger.exception("[ArpHandler] Error handling message")
 
     # ──────────────────────────────────────────────
     #  消息分发
@@ -328,7 +341,6 @@ class ArpHandler:
           Offset 26-29: 源 IP（4 bytes）
           Offset 30-33: 目标 IP（4 bytes）
         """
-        self.logger.info(f"[DEBUG] _handle_ip: {msg.dpid}:{msg.in_port}")
         self._total_ip_handled += 1
         raw = msg.data
 
@@ -467,7 +479,6 @@ class ArpHandler:
                     rules, remove_old=False,
                 )
                 self._total_flows_deployed += deployed
-                self.logger.info(f"[DEBUG] deploy_rules result: deployed={deployed}, failed={failed}")
                 if deployed > 0:
                     self.logger.info(
                         f"[ArpHandler] Flow deployed: {src_ip}({src_host.mac}) "
@@ -687,7 +698,6 @@ class ArpHandler:
                 f"[ArpHandler] Cannot find target (requester) {target_ip} in host table"
             )
             return
-        self.logger.info(f"[ARP_DEBUG] _send_arp_reply: target_ip={target_ip}, target_dpid={target_entry.dpid}, target_port={target_entry.port}")
         # Bug 13: 从请求者所在的交换机发送，而非收到 ARP Request 的交换机
         dp = self._dp_registry.get(target_entry.dpid)
         if dp is None:
@@ -764,7 +774,6 @@ class ArpHandler:
         修复后 out_port=None 时使用 OFPP_FLOOD 作为兜底（仅用于泛洪场景）。
         调用方（_send_arp_reply / _handle_arp_reply）应显式传入目标端口号。
         """
-        self.logger.info(f"[ARP_DEBUG] _packet_out: dpid={dp.id}, in_port={in_port}, out_port={out_port}")
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 

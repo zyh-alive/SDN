@@ -292,6 +292,21 @@ class Worker:
 
         return structured
     
+    def set_output_queues(
+        self,
+        topo_east: "Queue[Any]",
+        perf_east: "Queue[Any]",
+        west: "Queue[Any]",
+    ):
+        """替换输出队列为外部共享队列（多 Worker → 单消费者模式）。
+
+        用于将多个 Worker 的输出合并到同一队列中，消除消费者轮询多个队列的空转开销。
+        调用时机：Worker 创建后、start() 前。
+        """
+        self.topo_east_queue = topo_east
+        self.perf_east_queue = perf_east
+        self.west_queue = west
+
     def _put_to_queue(self, q: "Queue[Any]", item: Any):
         """线程安全地放入队列，满时丢弃最旧消息"""
         try:
