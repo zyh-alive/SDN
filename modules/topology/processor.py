@@ -415,27 +415,26 @@ class TopologyProcessor:
           XADD topology:events {...}   — 事件通知（StalkerManager XREADGROUP 消费）
 
         Processor 完全不知道下游消费者是谁，通过 Redis Stream 唯一交互中心解耦。
+
+        优化：SET + INCR + XADD 合入同一个 Pipeline，1 次网络往返完成全部 3 个操作。
         """
         if not self._redis:
             return
 
         client = self._redis.client
 
-        # 1. 管道写入快照 + 版本号
-        pipe = client.pipeline()  # type: ignore[reportUnknownMemberType]
-        pipe.set('topology:graph:current', json.dumps(self.graph.to_dict()))
-        pipe.incr('topology:graph:version')
-        pipe.execute()
-
-        # 2. 逐事件 XADD topology:events
-        #    每条事件独立写入，供 StalkerManager XREADGROUP 逐条消费
+        # Pipeline 批量执行：快照 + 版本号 + 事件通知（1 次网络往返，替代原来 2 次）
         batch_events = {'events': json.dumps([e.to_dict() for e in events])}
         try:
-            client.xadd(self.STREAM_TOPOLOGY, batch_events, maxlen=10000)  # type: ignore[reportArgumentType]
+            pipe = client.pipeline()  # type: ignore[reportUnknownMemberType]
+            pipe.set('topology:graph:current', json.dumps(self.graph.to_dict()))
+            pipe.incr('topology:graph:version')
+            pipe.xadd(self.STREAM_TOPOLOGY, batch_events, maxlen=10000)  # type: ignore[reportArgumentType]
+            pipe.execute()
         except Exception:
             if self.logger:
                 self.logger.exception(
-                    "[TopologyProcessor] XADD topology:events failed (%d events)",
+                    "[TopologyProcessor] Redis pipeline failed (%d events)",
                     len(events),
                 )
 

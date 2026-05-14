@@ -84,6 +84,9 @@ class PerformanceMonitor:
         # 已知链路集合
         self._known_links: Set[Tuple[int, int, int, int]] = set()
 
+        # 反向索引：(dpid, port_no) → [link_id, ...]（O(1) 端口→链路映射，消除 handle_stats_reply 的 O(n×m) 全表扫描）
+        self._port_to_links: Dict[Tuple[int, int], List[Tuple[int, int, int, int]]] = {}
+
         # STATS_REQUEST 待发送队列
         # [(dpid, port_no, link_id, timestamp)]
         self._pending_requests: List[Tuple[int, int, Tuple[int, int, int, int], float]] = []
@@ -156,19 +159,41 @@ class PerformanceMonitor:
 
     def register_link(self, link_id: Tuple[int, int, int, int]):
         """注册链路（保留供拓扑发现模块显式调用；自发现模式已覆盖常规场景）"""
-        self._known_links.add(link_id)
+        self._add_link_to_index(link_id)
         rev_key = (link_id[2], link_id[3], link_id[0], link_id[1])
-        self._known_links.add(rev_key)
+        self._add_link_to_index(rev_key)
 
     def unregister_link(self, link_id: Tuple[int, int, int, int]):
         """移除链路（保留供拓扑发现模块显式调用）"""
-        self._known_links.discard(link_id)
+        self._remove_link_from_index(link_id)
         rev_key = (link_id[2], link_id[3], link_id[0], link_id[1])
-        self._known_links.discard(rev_key)
+        self._remove_link_from_index(rev_key)
         self.calculator.reset(link_id)
         self.detector.reset_link(link_id)
         self.scheduler.remove_link(link_id)
         self._previous_levels.pop(link_id, None)
+
+    def _add_link_to_index(self, link_id: Tuple[int, int, int, int]) -> None:
+        """添加链路到已知集合 + 反向索引（O(1)）"""
+        self._known_links.add(link_id)
+        port_key = (link_id[0], link_id[1])
+        if port_key not in self._port_to_links:
+            self._port_to_links[port_key] = []
+        if link_id not in self._port_to_links[port_key]:
+            self._port_to_links[port_key].append(link_id)
+
+    def _remove_link_from_index(self, link_id: Tuple[int, int, int, int]) -> None:
+        """从已知集合 + 反向索引中移除链路（O(1)）"""
+        self._known_links.discard(link_id)
+        port_key = (link_id[0], link_id[1])
+        links = self._port_to_links.get(port_key)
+        if links:
+            try:
+                links.remove(link_id)
+            except ValueError:
+                pass
+            if not links:
+                del self._port_to_links[port_key]
 
     # ──────────────────────────────────────────────
     # 主循环
@@ -253,11 +278,11 @@ class PerformanceMonitor:
 
         link_id = (src_dpid, src_port, dst_dpid, dst_port)
 
-        # 自动注册链路到 _known_links（从 LLDP 帧自发现，不依赖拓扑模块调用 register_link）
+        # 自动注册链路到 _known_links + 反向索引（从 LLDP 帧自发现，不依赖拓扑模块调用 register_link）
         # 这对 STATS_REQUEST 调度和 STATS_REPLY 端口→链路映射都是必需的
-        self._known_links.add(link_id)
+        self._add_link_to_index(link_id)
         rev_link_id = (dst_dpid, dst_port, src_dpid, src_port)
-        self._known_links.add(rev_link_id)
+        self._add_link_to_index(rev_link_id)
 
         # 记录 LLDP 接收 → 时延
         delay_ms = self.calculator.record_lldp_recv(
@@ -279,7 +304,8 @@ class PerformanceMonitor:
         """
         now = time.time()
 
-        for link_id in list(self._known_links):
+        # 直接迭代 set（不在迭代中修改 _known_links，无需 list() 拷贝）
+        for link_id in self._known_links:
             src_dpid, src_port, dst_dpid, dst_port = link_id
 
             if not self.scheduler.should_sample(link_id, now):
@@ -340,15 +366,13 @@ class PerformanceMonitor:
             if port_throughput is None:
                 continue
 
-            # ── 映射端口吞吐量 → 链路吞吐量 ──
-            # 查找所有以 (dpid, port_no) 为 src 的已知链路
-            for link_id in list(self._known_links):
-                if link_id[0] == dpid and link_id[1] == port_no:
-                    self.calculator.set_link_throughput(link_id, port_throughput)
+            # ── 映射端口吞吐量 → 链路吞吐量（O(1) 反向索引，替代 O(n×m) 全表扫描） ──
+            for link_id in self._port_to_links.get((dpid, port_no), []):
+                self.calculator.set_link_throughput(link_id, port_throughput)
 
-                    # 更新调度器利用率
-                    utilization = min(port_throughput / 1e9, 1.0)
-                    self.scheduler.next_interval(link_id, utilization)
+                # 更新调度器利用率
+                utilization = min(port_throughput / 1e9, 1.0)
+                self.scheduler.next_interval(link_id, utilization)
 
     # ──────────────────────────────────────────────
     # LLDP 发送记录（由 collector 调用）
