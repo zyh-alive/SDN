@@ -161,12 +161,14 @@ class Worker:
         self._security_filter = SecurityFilter()
 
         # ── 输出队列引用（默认自建，可通过 set_output_queues 替换为共享队列） ──
-        # topo_east_queue: LLDP → 拓扑发现模块（TopologyProcessor）
-        # perf_east_queue: IP   → 性能检测模块（PerformanceMonitor）
-        # west_queue:      ARP/OTHER → 路由管理模块（Phase 4）
+        # topo_east_queue:        LLDP → 拓扑发现模块（TopologyProcessor）
+        # perf_east_queue:        IP   → 性能检测模块（PerformanceMonitor）
+        # west_queue:             ARP/OTHER → 路由管理模块（Phase 4）
+        # classification_queue:   IP   → 流量分类模块（Phase 5）
         self.topo_east_queue: "Queue[Any]" = queue.Queue(maxsize=queue_size)
         self.perf_east_queue: "Queue[Any]" = queue.Queue(maxsize=queue_size)
         self.west_queue: "Queue[Any]" = queue.Queue(maxsize=queue_size)
+        self.classification_queue: "Queue[Any]" = queue.Queue(maxsize=queue_size)
 
         # ── 线程状态 ──
         self._running = False
@@ -293,9 +295,11 @@ class Worker:
             self._total_east += 1
             self._total_perf += 1
         elif msg_type == StructuredMessage.TYPE_IP:
-            # IP → 仅西向队列（ArpHandler 消费：首包触发路由查找 → 流表下发）
+            # IP → 西向队列（ArpHandler 消费：首包触发路由查找 → 流表下发）
+            #     + 分类队列（FlowTracker 消费：五元组聚合 → 流量分类，Phase 5）
             # 性能检测不再消费 IP 包（改用 LLDP 时延 + STATS_REQUEST 吞吐量）
             self._put_to_queue(self.west_queue, structured)
+            self._put_to_queue(self.classification_queue, structured)
             self._total_west += 1
         else:
             # ARP / OTHER → 西向队列（ArpHandler 消费：主机学习 + 泛洪/回复）
@@ -317,15 +321,21 @@ class Worker:
         topo_east: "Queue[Any]",
         perf_east: "Queue[Any]",
         west: "Queue[Any]",
+        classification: "Optional[Queue[Any]]" = None,
     ):
         """替换输出队列为外部共享队列（多 Worker → 单消费者模式）。
 
         用于将多个 Worker 的输出合并到同一队列中，消除消费者轮询多个队列的空转开销。
         调用时机：Worker 创建后、start() 前。
+
+        Args:
+            classification: Phase 5 分类队列（可选，向后兼容）
         """
         self.topo_east_queue = topo_east
         self.perf_east_queue = perf_east
         self.west_queue = west
+        if classification is not None:
+            self.classification_queue = classification
 
     def _put_to_queue(self, q: "Queue[Any]", item: Any):
         """线程安全地放入队列，满时丢弃最旧消息"""

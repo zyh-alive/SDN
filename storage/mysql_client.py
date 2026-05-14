@@ -160,6 +160,43 @@ class MySQLClient:
                 self.logger.exception("[MySQLClient] Perf batch insert failed (%d rows)", len(rows))
             raise
 
+    def insert_class_log_batch(self, rows: List[Dict[str, Any]]) -> int:
+        """批量插入流量分类日志（executemany 单次网络往返）
+
+        Args:
+            rows: [{'flow_key': str, 'src_ip': str, 'dst_ip': str,
+                    'src_port': int, 'dst_port': int, 'protocol': int,
+                    'avg_packet_size': float, 'avg_iat': float,
+                    'packet_count': int, 'predicted_class': str,
+                    'confidence': float, 'is_pseudo_label': int}, ...]
+
+        Returns:
+            实际插入行数
+        """
+        if not rows:
+            return 0
+
+        insert_sql = text("""
+            INSERT INTO flow_class_log
+                (flow_key, src_ip, dst_ip, src_port, dst_port, protocol,
+                 avg_packet_size, avg_iat, packet_count,
+                 predicted_class, confidence, is_pseudo_label)
+            VALUES
+                (:flow_key, :src_ip, :dst_ip, :src_port, :dst_port, :protocol,
+                 :avg_packet_size, :avg_iat, :packet_count,
+                 :predicted_class, :confidence, :is_pseudo_label)
+        """)
+
+        try:
+            with self._engine.connect() as conn:
+                conn.execute(insert_sql, rows)
+                conn.commit()
+            return len(rows)
+        except Exception:
+            if self.logger:
+                self.logger.exception("[MySQLClient] Class log batch insert failed (%d rows)", len(rows))
+            raise
+
     @property
     def engine(self) -> Engine:
         return self._engine

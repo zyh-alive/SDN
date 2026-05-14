@@ -10,5 +10,6 @@ from __future__ import annotations
 from storage.models.base import Base
 from storage.models.topology_changelog import TopologyChangelog
 from storage.models.perf_history import PerfHistory
+from storage.models.flow_class_log import FlowClassLog
 
-__all__ = ["Base", "TopologyChangelog", "PerfHistory"]
+__all__ = ["Base", "TopologyChangelog", "PerfHistory", "FlowClassLog"]
