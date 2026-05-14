@@ -733,33 +733,29 @@ class SDNController(app_manager.RyuApp):
 
     def _on_routes_updated(self, summary: Dict[str, Any]):
         """
-        RouteManager 重算完成后的回调 — 仅记录日志，不下发流表。
+        RouteManager 重算完成后回调 — 触发主动批量重下发。
 
-        拓扑变更时 RouteManager 预计算所有路由对并缓存到内存中。
-        实际流表下发延迟到 ArpHandler 收到首包时：
-          ArpHandler._try_deploy_flow() → 查 RouteManager 缓存
-            → compile_path_rules(带 MAC/IP/in_port 精确匹配)
-              → FlowDeployer.deploy_rules()
+        管线：
+          拓扑变更 / 拥堵等级变化
+            → RouteManager.recompute_all()（预计算所有交换机对路由缓存）
+            → _on_routes_updated(self)  ← 本方法
+              → ArpHandler.clear_deployed_flows()
+                ├── 步骤 1: OFPFC_DELETE 全量清除所有交换机上的路由流表
+                └── 步骤 2: 遍历 _deployed_flows 快照，
+                    逐条查 KSP+QoS 缓存 → compile_path_rules(精确匹配)
+                    → deploy_rules(remove_old=False)
+                    主动重建所有活跃通信对的新路径流表
 
-        这避免了此前「拓扑变更时生成 match={} 通配规则（priority=100）
-        劫持所有流量」的 Bug。
-
-        管线对比：
-          ❌ 旧: 拓扑变更 → compile_p0/p1(无匹配字段) → deploy(通配规则 hijack 所有流量)
-          ✅ 新: 拓扑变更 → recompute_all() 入缓存（仅内存）
-                 → 首包 → ArpHandler → 查缓存 → compile(精确 MAC/IP/in_port) → deploy
+        优势：无需等待下个 PacketIn 触发，避免额外 RTT 延迟。
 
         Args:
             summary: RouteManager.recompute_all() 的返回 dict
         """
         self.logger.info(
-            f"[FlowDeploy] Topology changed — route cache updated "
+            f"[FlowDeploy] Routes updated — clearing + actively redeploying "
             f"(routes={summary.get('routes', 0)} "
-            f"switches={summary.get('switches', 0)}). "
-            f"Flow rules will be deployed on first packet by ArpHandler."
+            f"switches={summary.get('switches', 0)})"
         )
 
-        # 清空 ArpHandler 的 _deployed_flows 记录，使已有通信对
-        # 在下次首包时重新查路由 → 走新路径（修复拓扑变更后流表不更新）
         if hasattr(self, 'arp_handler') and self.arp_handler:
             self.arp_handler.clear_deployed_flows()

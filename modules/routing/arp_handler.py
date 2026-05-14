@@ -102,8 +102,8 @@ class ArpHandler:
         self._table_lock = threading.Lock()
 
         # 已下发流表的 (src_ip, dst_ip) 字典（两阶段流表下发）
-        #   值: "phase1" = Dijkstra 临时流表（等待分类结果）
-        #       "phase2" = KSP+QoS 最终流表（分类后最优路径）
+        #   值: "pending" = Dijkstra 临时流表（等待分类结果）
+        #       "realtime"|"interactive"|"streaming"|"bulk"|"other" = KSP+QoS 最终流表
         self._deployed_flows: Dict[Tuple[str, str], str] = {}
         self._deployed_lock = threading.Lock()
 
@@ -150,22 +150,133 @@ class ArpHandler:
 
     def clear_deployed_flows(self) -> int:
         """
-        清空已下发流表记录，拓扑变更时由 _on_routes_updated 回调调用。
+        主动重下发：清除硬件旧规则 → 批量重建所有活跃通信对的流表。
 
-        清空后，下一次首包到达时 _try_deploy_flow() 会重新走 Phase 1
-        (Dijkstra) → Phase 2 (KSP+QoS) 两阶段下发流程，
-        同时旧规则通过 idle_timeout 自然老化。
+        拓扑变更 / 拥堵等级变化时由 _on_routes_updated 回调调用。
+
+        步骤：
+          1. 遍历所有在线 DPID，OFPFC_DELETE 清除路由相关流表规则
+          2. 对 _deployed_flows 中每条活跃通信对：
+             - 取关联 profile（"pending" 退化为 "other"）
+             - 查 KSP+QoS 缓存路由 → compile_path_rules → deploy_rules(remove_old=False)
+             - 更新 _deployed_flows 为该 profile
+          3. 跳过主机学习表中已不存在或同交换机的条目
+
+        优势：无需等待下个 PacketIn 触发，避免额外 RTT 延迟。
+              批量下发可合并连续的 FlowMod 消息。
 
         Returns:
-            清空前缓存的流表对数量
+            重下发前的活跃通信对数量
         """
+        if not self._flow_deployer or not self._route_manager:
+            return 0
+
+        # ── 步骤 1：清除所有交换机上的路由流表规则 ──
+        hardware_cleaned = 0
+        if self._dp_registry:
+            for dpid in list(self._dp_registry._dps.keys()):
+                try:
+                    self._flow_deployer.remove_rules_by_cookie(
+                        dpid,
+                        cookie=self._flow_deployer.COOKIE_ROUTE_PRIMARY,
+                        cookie_mask=self._flow_deployer.COOKIE_MASK,
+                    )
+                    hardware_cleaned += 1
+                except Exception:
+                    if self.logger:
+                        self.logger.debug(
+                            "[ArpHandler] Failed to clean rules for DPID=%d", dpid,
+                        )
+
+        # ── 步骤 2：取快照 → 批量重下发 ──
         with self._deployed_lock:
-            count = len(self._deployed_flows)
+            snapshot = dict(self._deployed_flows)
             self._deployed_flows.clear()
+
+        count = len(snapshot)
+        redeployed = 0
+        skipped = 0
+
+        if count > 0 and self._topology_graph:
+            from modules.flow_table.compiler import (
+                compile_path_rules,
+                PRIORITY_PRIMARY,
+            )
+
+            graph = self._topology_graph.get_full()
+
+            for (src_ip, dst_ip), stored_profile in snapshot.items():
+                try:
+                    src_host = self._lookup_ip(src_ip)
+                    dst_host = self._lookup_ip(dst_ip)
+                    if src_host is None or dst_host is None:
+                        skipped += 1
+                        continue
+                    if src_host.dpid == dst_host.dpid:
+                        # 同交换机：重新下发 L2 规则
+                        self._deploy_l2_rule(src_host, dst_host)
+                        with self._deployed_lock:
+                            self._deployed_flows[(src_ip, dst_ip)] = stored_profile
+                        redeployed += 1
+                        continue
+
+                    # "pending" 表示尚未分类 → 退化为 "other" profile
+                    profile = stored_profile if stored_profile != "pending" else "other"
+
+                    route = self._route_manager.get_route(
+                        src_host.dpid, dst_host.dpid, profile=profile
+                    )
+                    if route is None:
+                        skipped += 1
+                        continue
+
+                    if route.get("is_p0"):
+                        primary = route["p0"]["primary"]
+                    else:
+                        primary = route["p1"]["primary"]
+
+                    if primary is None or not primary.path:
+                        skipped += 1
+                        continue
+
+                    rules = compile_path_rules(
+                        path=primary.path,
+                        graph=graph,
+                        src_dpid=src_host.dpid,
+                        dst_dpid=dst_host.dpid,
+                        src_mac=src_host.mac,
+                        dst_mac=dst_host.mac,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        first_hop_in_port=src_host.port,
+                        dst_host_port=dst_host.port,
+                        priority=PRIORITY_PRIMARY,
+                        rule_prefix="arp_flow",
+                    )
+
+                    # remove_old=False：硬件已在步骤 1 全量清除
+                    deployed, _ = self._flow_deployer.deploy_rules(
+                        rules, remove_old=False,
+                    )
+                    self._total_flows_deployed += deployed
+
+                    with self._deployed_lock:
+                        self._deployed_flows[(src_ip, dst_ip)] = profile
+                    redeployed += 1
+
+                except Exception:
+                    if self.logger:
+                        self.logger.debug(
+                            "[ArpHandler] Failed to redeploy %s→%s",
+                            src_ip, dst_ip, exc_info=True,
+                        )
+                    skipped += 1
+
         if self.logger:
             self.logger.info(
-                "[ArpHandler] Cleared %d deployed flow records "
-                "(topology changed, will re-deploy two-phase on next packet)", count,
+                "[ArpHandler] Cleared %d DPIDs hardware + redeployed %d/%d flows "
+                "(%d skipped) (topology/perf changed)",
+                hardware_cleaned, redeployed, count, skipped,
             )
         return count
 
@@ -396,17 +507,17 @@ class ArpHandler:
         Phase 1 (t=0, 首包触发):
           - Dijkstra 最短路径（uniform weight=1, O(V+E) 极快）
           - 下发临时流表（带 OFPP_CONTROLLER 镜像，供分类采样）
-          - 标记为 "phase1"，等待流量分类结果
+          - 标记为 "pending"，等待流量分类结果
 
         Phase 2 (t<5ms, 分类完成后):
           - _redeploy_with_profile() 被 _on_flow_flush 回调触发
           - KSP + QoS 效用值精算 → 最优路径
-          - remove_old=True 替换 Phase 1 临时流表 → 标记为 "phase2"
+          - remove_old=True 替换 Phase 1 临时流表 → 标记为实际 profile
 
         时序保证:
           - Phase 1 流表 idle_timeout=60s，即使分类永远不来也能自动老化
           - Phase 2 在首次分类输出（首包即输出，LEARNING_PACKETS=1）后触发
-          - 同交换机场景直接走 L2 转发（无需路由），标记为 "phase2" 跳过 Phase 1
+          - 同交换机场景直接走 L2 转发（无需路由），标记为 "other" 跳过 Phase 1
 
         Args:
             src_ip: 源 IP
@@ -415,9 +526,9 @@ class ArpHandler:
         """
         flow_key = (src_ip, dst_ip)
         with self._deployed_lock:
-            phase = self._deployed_flows.get(flow_key)
-        if phase is not None:
-            # 流表已下发（phase1 或 phase2），仅转发当前包
+            already_deployed = flow_key in self._deployed_flows
+        if already_deployed:
+            # 流表已下发，仅转发当前包
             src_host = self._lookup_ip(src_ip)
             dst_host = self._lookup_ip(dst_ip)
             if src_host and dst_host:
@@ -441,10 +552,10 @@ class ArpHandler:
             from modules.routing.ksp import dijkstra_shortest_path
 
             if src_host.dpid == dst_host.dpid:
-                # 同交换机：无需路由，直接 L2 转发 → 标记 phase2
+                # 同交换机：无需路由，直接 L2 转发 → 标记 "other"
                 self._deploy_l2_rule(src_host, dst_host)
                 with self._deployed_lock:
-                    self._deployed_flows[flow_key] = "phase2"
+                    self._deployed_flows[flow_key] = "other"
                 self._forward_first_packet(msg, src_host, dst_host=dst_host)
                 return
 
@@ -502,9 +613,9 @@ class ArpHandler:
                     f"path={path} | {deployed} rules"
                 )
 
-            # 标记为 Phase 1（等待分类结果 → _redeploy_with_profile）
+            # 标记为 "pending"（等待分类结果 → _redeploy_with_profile）
             with self._deployed_lock:
-                self._deployed_flows[flow_key] = "phase1"
+                self._deployed_flows[flow_key] = "pending"
 
             # 转发首包（Phase 1 流表已下发，传入 Dijkstra 路径避免二次查询）
             self._forward_first_packet(msg, src_host, dst_host=dst_host, path=path)
@@ -524,7 +635,7 @@ class ArpHandler:
           2. 查 RouteManager.get_route(profile) → 取 KSP+QoS 最优路径
           3. 编译 compile_path_rules(带 MAC/IP/in_port)
           4. deploy_rules(remove_old=True) 替换 Phase 1 规则
-          5. 标记为 "phase2"
+          5. 标记为实际 profile（如 "streaming"）
 
         Args:
             src_ip:  源 IP
@@ -536,10 +647,10 @@ class ArpHandler:
         """
         flow_key = (src_ip, dst_ip)
 
-        # 仅当处于 phase1 时才执行 Phase 2（幂等保护）
+        # 仅当处于 "pending" 时才执行 Phase 2（幂等保护）
         with self._deployed_lock:
-            current_phase = self._deployed_flows.get(flow_key)
-        if current_phase != "phase1":
+            current = self._deployed_flows.get(flow_key)
+        if current != "pending":
             return False
 
         src_host = self._lookup_ip(src_ip)
@@ -553,7 +664,7 @@ class ArpHandler:
             return False
 
         if src_host.dpid == dst_host.dpid:
-            # 同交换机：已在 Phase 1 标记为 phase2，无需重下发
+            # 同交换机：已在 Phase 1 标记为 "other"，无需重下发
             return True
 
         if not self._route_manager or not self._flow_deployer:
@@ -612,9 +723,9 @@ class ArpHandler:
             )
             self._total_flows_deployed += deployed
 
-            # 标记为 Phase 2（分类完成后的最终流表）
+            # 标记为分类完成后的最终流表（存储实际 profile）
             with self._deployed_lock:
-                self._deployed_flows[flow_key] = "phase2"
+                self._deployed_flows[flow_key] = profile
 
             if deployed > 0:
                 self.logger.info(
@@ -689,7 +800,7 @@ class ArpHandler:
 
         两阶段流表下发适配：
           - Phase 1 调用时传入 path=Dijkstra 路径，直接从路径计算 out_port
-          - 已下发流表场景（phase1/phase2），回退到 route_manager 查询
+          - 已下发流表场景（pending 或已分类 profile），回退到 route_manager 查询
 
         Args:
             msg:      触发转发的原始消息
