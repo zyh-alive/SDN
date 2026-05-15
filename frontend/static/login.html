@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>N.E.X.U.S — SDN 多业务 QoS 透传管控系统</title>
+    <link rel="stylesheet" href="/css/login.css">
+</head>
+<body>
+
+    <!-- Canvas: 矩阵雨动效 -->
+    <canvas id="matrix-rain"></canvas>
+
+    <!-- Canvas: 粒子网格背景 -->
+    <canvas id="particle-grid"></canvas>
+
+    <!-- 扫描线 -->
+    <div class="scanline"></div>
+
+    <!-- 主容器 -->
+    <div class="login-container">
+
+        <!-- 徽标 -->
+        <div class="logo">
+            <span class="logo-diamond">◆</span>
+            <span class="logo-text">N.E.X.U.S</span>
+            <span class="logo-diamond">◆</span>
+        </div>
+        <div class="logo-subtitle">
+            Network Excellence eXtensible Unified System
+        </div>
+
+        <!-- 标题栏 -->
+        <div class="title-bar">
+            <span class="title-bracket">[</span>
+            <span class="title-tag">SDN</span>
+            <span class="title-text">多业务 QoS 透传管控系统</span>
+            <span class="title-bracket">]</span>
+        </div>
+
+        <!-- 错误信息 -->
+        <div id="error-msg" class="error-msg hidden">
+            <span class="error-icon">⚠</span>
+            <span id="error-text"></span>
+        </div>
+
+        <!-- 登录表单 -->
+        <form id="login-form" class="login-form" autocomplete="off">
+            <div class="input-group">
+                <label class="input-label" for="username">
+                    <span class="cursor">▌</span> 身份标识
+                </label>
+                <input
+                    type="text"
+                    id="username"
+                    class="input-field"
+                    placeholder="输入用户名..."
+                    value="zyh"
+                    autocomplete="off"
+                    spellcheck="false"
+                >
+            </div>
+
+            <div class="input-group">
+                <label class="input-label" for="password">
+                    <span class="cursor">▌</span> 安全凭证
+                </label>
+                <input
+                    type="password"
+                    id="password"
+                    class="input-field"
+                    placeholder="输入密码..."
+                    value="040911"
+                    autocomplete="off"
+                >
+            </div>
+
+            <button type="submit" class="btn-connect">
+                <span class="btn-text">建 立 连 接</span>
+                <span class="btn-glow"></span>
+            </button>
+        </form>
+
+        <!-- 底部状态栏 -->
+        <div class="status-bar">
+            <span class="status-item">
+                <span class="status-dot"></span>
+                网络状态: <span id="net-status">待连接</span>
+            </span>
+            <span class="status-item">
+                加密: AES-256
+            </span>
+            <span class="status-item">
+                版本: v4.0
+            </span>
+        </div>
+
+        <!-- 装饰文字 -->
+        <div class="decorative-text">
+            <!-- Secure Connection Required -->
+        </div>
+    </div>
+
+    <script src="/js/login.js"></script>
+</body>
+</html>

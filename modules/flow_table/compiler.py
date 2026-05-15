@@ -50,7 +50,7 @@ class FlowRule:
     match_fields: Dict[str, Any] = field(default_factory=dict[str, Any])
     actions: List[Dict[str, Any]] = field(default_factory=list[Dict[str, Any]])
     table_id: int = 0
-    idle_timeout: int = 60   # 60 秒无流量自动老化，拓扑变更后旧路径规则自然淘汰
+    idle_timeout: int = 0    # 永不过期，流表生命周期由 ArpHandler.clear_deployed_flows() 显式管理
     hard_timeout: int = 0
     cookie: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict[str, Any])

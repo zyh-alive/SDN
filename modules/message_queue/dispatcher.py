@@ -1,20 +1,23 @@
 """
-Hash Dispatcher（多线程分发器 — 纯透传）
+轮转分发器 (Round-Robin Dispatcher) — 纯透传，完全负载均衡
 
 功能：
 1. 从 Ring Buffer 消费消息（阻塞读取）
-2. 对数据包做 crc32 hash 后非阻塞推送到 Worker input_queue
+2. 按轮转顺序 (0→1→2→0→1→2...) 非阻塞推送到 Worker input_queue
 3. 不做任何 EtherType 分类（分类由 Worker 完成），实现纯透传
 
 架构：
-  - Dispatcher 线程：pop → hash → put（极轻量，延迟极低）
+  - Dispatcher 线程：pop → round-robin → put（极轻量，零哈希计算）
   - Worker 线程：   get → 安全过滤 → EtherType 分类 → 写入输出队列
+
+轮转分发理由：
+  - 三个 Worker 职责完全相同，不需要流亲和性（保序由上层 TCP 保证）
+  - CRC32 hash 对相似结构报文（ARP/ICMP）的 % 3 分布极不均匀
+  - 轮转分发零 CPU 开销，完美负载均衡
 """
 
 import queue
-import struct
 import threading
-import zlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from modules.message_queue.ring_buffer import RingBuffer
@@ -30,7 +33,7 @@ class Dispatcher:
     - 直接 dispatch() → worker.input_queue.put()（西向快通道）
 
     线程拓扑（共 1 + N 线程）：
-    - 1 个 Dispatcher 线程：pop → hash → put (极轻量)
+    - 1 个 Dispatcher 线程：pop → round-robin → put (极轻量，零哈希)
     - N 个 Worker 线程：get → 过滤 → 解析 → 写入输出队列（CPU 密集型）
     """
 
@@ -52,6 +55,9 @@ class Dispatcher:
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
+
+        # 轮转计数器：单 Dispatcher 线程访问，无需锁
+        self._next_worker = 0
 
         # 统计
         self._total_dispatched_east = 0
@@ -90,7 +96,7 @@ class Dispatcher:
         """
         Dispatcher 线程主循环
 
-        从 Ring Buffer 阻塞读取 → hash 分发 → 非阻塞 put 到 Worker input_queue。
+        从 Ring Buffer 阻塞读取 → 轮转分发 → 非阻塞 put 到 Worker input_queue。
         不执行任何 CPU 密集型操作，延迟极低。
         """
         while self._running:
@@ -103,30 +109,14 @@ class Dispatcher:
         """
         将消息非阻塞推送到固定 Worker 的 input_queue
 
-        分发策略：zlib.crc32(raw_data) XOR (dpid * 31 + in_port) % num_workers
-        crc32 覆盖全包内容（LLDP 的 chassis ID/port ID/TTL 各不相同），
-        XOR 接收侧 (dpid, in_port) 确保双向散射。
-        相同数据包产生相同 crc32，保持流亲和性（保序）。
+        分发策略：轮转 (Round-Robin) 0→1→2→0→1→2...
+        - 三个 Worker 职责完全相同，无需流亲和性
+        - 单 Dispatcher 线程访问 _next_worker，无需锁
+        - 零哈希计算，完美负载均衡
         """
-        try:
-            dpid = msg.datapath.id
-        except Exception:
-            dpid = 0
-
-        try:
-            in_port = msg.match.get('in_port', 0) if msg.match else 0
-        except Exception:
-            in_port = 0
-
-        raw_data = msg.data
-        if raw_data:
-            # crc32 全包 hash → 无符号 → 黄金比例乘法混合（bit 雪崩效应）
-            # 解决相似数据包（ARP 泛洪）的 crc32 低 bit 聚类问题
-            h = zlib.crc32(raw_data) & 0xFFFFFFFF
-            h = (h * 0x9E3779B9) & 0xFFFFFFFF  # 黄金比例素数，保证 bit 雪崩
-            idx = (h + dpid * 31 + in_port) % self._num_workers
-        else:
-            idx = hash((dpid, in_port)) % self._num_workers
+        # 轮转取 Worker，然后推进计数器
+        idx = self._next_worker
+        self._next_worker = (self._next_worker + 1) % self._num_workers
         worker = self._workers[idx]
 
         # 非阻塞 put：Dispatcher 不等待 Worker 处理完成

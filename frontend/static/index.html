@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDN 多业务 QoS 管控平台 — N.E.X.U.S</title>
+    <link rel="stylesheet" href="/css/dashboard.css">
+    <!-- ECharts 5 CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <!-- Socket.IO Client -->
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body>
+
+    <!-- ── 顶栏 ── -->
+    <header class="topbar">
+        <div class="topbar-left">
+            <span class="topbar-logo">◆ N.E.X.U.S</span>
+            <span class="topbar-subtitle">SDN 多业务 QoS 透传管控系统</span>
+        </div>
+        <div class="topbar-right">
+            <span id="sys-status" class="sys-status">
+                <span class="status-dot offline"></span>
+                系统状态
+            </span>
+            <span id="topo-version" class="topo-version">拓扑 v--</span>
+            <span class="topbar-user">
+                <span class="user-icon">⬤</span>
+                <span id="username-display">zyh</span>
+            </span>
+            <button id="btn-logout" class="btn-logout" title="断开连接">⟲ 登出</button>
+        </div>
+    </header>
+
+    <!-- ── Tab 导航 ── -->
+    <nav class="tab-nav">
+        <button class="tab-btn active" data-tab="dashboard">
+            <span class="tab-icon">◈</span> 首页看板
+        </button>
+        <button class="tab-btn" data-tab="performance">
+            <span class="tab-icon">◉</span> 性能监测
+        </button>
+        <button class="tab-btn" data-tab="classification">
+            <span class="tab-icon">◈</span> 流量分类
+        </button>
+        <button class="tab-btn" data-tab="flows">
+            <span class="tab-icon">▣</span> 流表管理
+        </button>
+        <button class="tab-btn" data-tab="history">
+            <span class="tab-icon">◷</span> 历史记录
+        </button>
+    </nav>
+
+    <!-- ── 内容区 ── -->
+    <main class="main-content">
+
+        <!-- ═══════════════════════════════════════════ -->
+        <!--  首页看板 (Dashboard)                      -->
+        <!-- ═══════════════════════════════════════════ -->
+        <section id="tab-dashboard" class="tab-panel active">
+            <!-- 概览卡片 -->
+            <div class="overview-cards">
+                <div class="card">
+                    <div class="card-label">交换机数</div>
+                    <div id="card-switches" class="card-value">--</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">链路数</div>
+                    <div id="card-links" class="card-value">--</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">活跃流数</div>
+                    <div id="card-flows" class="card-value">--</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">拥堵告警</div>
+                    <div id="card-alerts" class="card-value alert">--</div>
+                </div>
+            </div>
+
+            <!-- 拓扑图 -->
+            <div class="panel">
+                <div class="panel-header">
+                    <span class="panel-title">◆ 网络拓扑图</span>
+                    <span id="topo-graph-version" class="panel-badge">v--</span>
+                </div>
+                <div id="chart-topology" class="chart-box chart-topo"></div>
+            </div>
+
+            <!-- 下半部分：分类分布 + 吞吐量趋势 -->
+            <div class="half-row">
+                <div class="panel half-panel">
+                    <div class="panel-header">
+                        <span class="panel-title">◆ 流量分类分布</span>
+                    </div>
+                    <div id="chart-class-pie" class="chart-box chart-half"></div>
+                </div>
+                <div class="panel half-panel">
+                    <div class="panel-header">
+                        <span class="panel-title">◆ 全网总吞吐量趋势</span>
+                    </div>
+                    <div id="chart-throughput-trend" class="chart-box chart-half"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══════════════════════════════════════════ -->
+        <!--  性能监测 (Performance)                    -->
+        <!-- ═══════════════════════════════════════════ -->
+        <section id="tab-performance" class="tab-panel">
+            <div class="perf-layout">
+                <!-- 左侧链路列表 -->
+                <div class="perf-sidebar">
+                    <div class="panel-header">
+                        <span class="panel-title">◆ 链路列表</span>
+                    </div>
+                    <div id="link-list" class="link-list">
+                        <div class="link-list-empty">加载中...</div>
+                    </div>
+                </div>
+                <!-- 右侧 2x2 图表 -->
+                <div class="perf-charts">
+                    <div class="panel">
+                        <div class="panel-header">
+                            <span class="panel-title">▲ 吞吐量 (bps)</span>
+                        </div>
+                        <div id="chart-perf-throughput" class="chart-box chart-perf-single"></div>
+                    </div>
+                    <div class="panel">
+                        <div class="panel-header">
+                            <span class="panel-title">◆ 时延 (ms)</span>
+                        </div>
+                        <div id="chart-perf-delay" class="chart-box chart-perf-single"></div>
+                    </div>
+                    <div class="panel">
+                        <div class="panel-header">
+                            <span class="panel-title">◆ 抖动 (ms)</span>
+                        </div>
+                        <div id="chart-perf-jitter" class="chart-box chart-perf-single"></div>
+                    </div>
+                    <div class="panel">
+                        <div class="panel-header">
+                            <span class="panel-title">▼ 丢包率 (%)</span>
+                        </div>
+                        <div id="chart-perf-loss" class="chart-box chart-perf-single"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══════════════════════════════════════════ -->
+        <!--  流量分类 (Classification)                -->
+        <!-- ═══════════════════════════════════════════ -->
+        <section id="tab-classification" class="tab-panel">
+            <div class="half-row">
+                <div class="panel half-panel">
+                    <div class="panel-header">
+                        <span class="panel-title">◆ 分类分布</span>
+                    </div>
+                    <div id="chart-class-dist" class="chart-box chart-half"></div>
+                </div>
+                <div class="panel half-panel">
+                    <div class="panel-header">
+                        <span class="panel-title">◆ 分类统计</span>
+                    </div>
+                    <div id="class-summary" class="summary-box">
+                        <div class="summary-row">
+                            <span>总流数:</span>
+                            <span id="sum-total">--</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>伪标签比例:</span>
+                            <span id="sum-pseudo">--</span>
+                        </div>
+                        <div id="sum-by-class"></div>
+                    </div>
+                </div>
+            </div>
+            <!-- 分类历史表格 -->
+            <div class="panel" style="margin-top: 16px;">
+                <div class="panel-header">
+                    <span class="panel-title">◆ 分类历史</span>
+                    <div class="panel-actions">
+                        <select id="class-filter" class="filter-select">
+                            <option value="all">全部类别</option>
+                            <option value="realtime">实时</option>
+                            <option value="interactive">交互</option>
+                            <option value="streaming">流媒体</option>
+                            <option value="bulk">批量</option>
+                            <option value="other">其他</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="table-wrap">
+                    <table id="class-table" class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Flow Key</th>
+                                <th>源 → 目的</th>
+                                <th>协议</th>
+                                <th>端口</th>
+                                <th>类别</th>
+                                <th>置信度</th>
+                                <th>伪标签</th>
+                                <th>时间</th>
+                            </tr>
+                        </thead>
+                        <tbody id="class-tbody">
+                            <tr><td colspan="8" class="empty-row">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══════════════════════════════════════════ -->
+        <!--  流表管理 (Flows)                          -->
+        <!-- ═══════════════════════════════════════════ -->
+        <section id="tab-flows" class="tab-panel">
+            <div class="panel">
+                <div class="panel-header">
+                    <span class="panel-title">◆ 交换机流表信息</span>
+                    <span class="panel-hint">数据来源: OVS dump-flows (实时查询)</span>
+                </div>
+                <div id="flows-status" class="flows-status">
+                    <span class="status-dot offline"></span>
+                    等待控制器数据...
+                </div>
+                <div class="table-wrap">
+                    <table id="flows-table" class="data-table">
+                        <thead>
+                            <tr>
+                                <th>交换机</th>
+                                <th>优先级</th>
+                                <th>Cookie</th>
+                                <th>匹配字段</th>
+                                <th>动作</th>
+                                <th>超时</th>
+                            </tr>
+                        </thead>
+                        <tbody id="flows-tbody">
+                            <tr><td colspan="6" class="empty-row">暂无数据 — 需通过 OVS 获取流表</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══════════════════════════════════════════ -->
+        <!--  历史记录 (History)                        -->
+        <!-- ═══════════════════════════════════════════ -->
+        <section id="tab-history" class="tab-panel">
+            <!-- 拓扑变更时间轴 -->
+            <div class="panel">
+                <div class="panel-header">
+                    <span class="panel-title">◆ 拓扑变更时间轴</span>
+                    <span class="panel-hint">最近 50 条记录</span>
+                </div>
+                <div id="topo-timeline" class="timeline">
+                    <div class="timeline-empty">加载中...</div>
+                </div>
+            </div>
+
+            <!-- 性能历史曲线 -->
+            <div class="panel" style="margin-top: 16px;">
+                <div class="panel-header">
+                    <span class="panel-title">◆ 性能历史曲线</span>
+                    <div class="panel-actions">
+                        <select id="hist-link-select" class="filter-select">
+                            <option value="">选择链路...</option>
+                        </select>
+                        <select id="hist-mins-select" class="filter-select">
+                            <option value="15">15 分钟</option>
+                            <option value="30">30 分钟</option>
+                            <option value="60" selected>1 小时</option>
+                            <option value="180">3 小时</option>
+                            <option value="360">6 小时</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="chart-perf-history" class="chart-box chart-wide"></div>
+            </div>
+
+            <!-- 分类历史表格 -->
+            <div class="panel" style="margin-top: 16px;">
+                <div class="panel-header">
+                    <span class="panel-title">◆ 分类历史</span>
+                </div>
+                <div class="table-wrap">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Flow Key</th>
+                                <th>源 → 目的</th>
+                                <th>类别</th>
+                                <th>置信度</th>
+                                <th>伪标签</th>
+                                <th>时间</th>
+                            </tr>
+                        </thead>
+                        <tbody id="hist-class-tbody">
+                            <tr><td colspan="6" class="empty-row">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- ── 页脚状态栏 ── -->
+    <footer class="bottombar">
+        <span id="footer-clock">--</span>
+        <span>CPU: <span id="footer-cpu">--</span></span>
+        <span>Redis: <span id="footer-redis">⏳</span></span>
+        <span>MySQL: <span id="footer-mysql">⏳</span></span>
+        <span>WS: <span id="footer-ws">未连接</span></span>
+    </footer>
+
+    <!-- ── JS Modules (顺序加载) ── -->
+    <script src="/js/api.js"></script>
+    <script src="/js/topology.js"></script>
+    <script src="/js/performance.js"></script>
+    <script src="/js/classification.js"></script>
+    <script src="/js/flows.js"></script>
+    <script src="/js/history.js"></script>
+    <script src="/js/app.js"></script>
+</body>
+</html>
