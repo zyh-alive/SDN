@@ -62,6 +62,10 @@ class LLDPCollector:
         # 下行队列：主控线程消费此队列并实际 send_msg
         self.downlink_queue: List[Tuple[Any, Any]] = []  # list of (datapath, ofp_msg)
 
+        # 信号量：LLDP 线程发完包后置位，eventlet drain 协程检查后清空
+        # 避免 drain 协程每 100ms 盲轮询空队列（2s 内 19/20 次空转）
+        self._downlink_ready = threading.Event()
+
         # LLDP 发送回调（注入 PerformanceMonitor.on_lldp_sent）
         # 每次构造 LLDP 帧时调用，传入 (dpid, port_no) 供性能检测记录时间戳
         self.on_lldp_sent_callback: Optional[Callable[[int, int], None]] = None
@@ -72,12 +76,20 @@ class LLDPCollector:
         self._thread: Optional[threading.Thread] = None
 
     def register_switch(self, dpid: int, datapath: Any):
-        """注册交换机（由 app.py 在 switch_features_handler 中调用）"""
+        """注册交换机（由 app.py 在 switch_features_handler 中调用）。
+
+        注册后立刻对该交换机发送 LLDP（不等 2s 周期），
+        _run_loop 的 2s 轮询作为链路持续刷新的兜底。
+        """
         with self._lock:
-            self._switches[dpid] = SwitchHandle(dpid, datapath) 
-            #把交换机注册到采集器的交换机表中，供后续发送 LLDP 包使用，这是个字典，键是交换机的 DPID，值是一个 SwitchHandle 对象，包含了交换机的连接信息和通信接口
+            sw = SwitchHandle(dpid, datapath)
+            self._switches[dpid] = sw
         if self.logger:
             self.logger.info(f"[LLDPCollector] Registered switch {dpid:016x}")
+        # 注册即发：立刻构造 LLDP 送入下行队列 + 唤醒 drain 协程
+        if self._running:
+            self._send_lldp_for_switch(sw)
+            self._downlink_ready.set()
 
     def unregister_switch(self, dpid: int):
         """移除交换机"""
@@ -146,6 +158,10 @@ class LLDPCollector:
         for sw in switches:
             self._send_lldp_for_switch(sw)
 
+        # 通知 eventlet drain 协程：下行队列有货了
+        if switches:
+            self._downlink_ready.set()
+
     def _send_lldp_for_switch(self, sw: SwitchHandle):
         """为单台交换机的所有端口构造 LLDP 并下发"""
         chassis_mac = dpid_to_mac(sw.dpid)
@@ -196,6 +212,8 @@ class LLDPCollector:
         with self._lock:
             items = self.downlink_queue[:]
             self.downlink_queue.clear()
+        # 清空后放下信号旗，避免 drain 协程重复排空
+        self._downlink_ready.clear()
         return items
 
     def stats(self) -> Dict[str, Any]:

@@ -107,6 +107,10 @@ class ArpHandler:
         self._deployed_flows: Dict[Tuple[str, str], str] = {}
         self._deployed_lock = threading.Lock()
 
+        # Phase 1 Dijkstra 路径缓存: {(src_dpid, dst_dpid): [dpid_0, ..., dpid_n]}
+        # 拓扑变更时随 _deployed_flows 一起清空
+        self._dijkstra_cache: Dict[Tuple[int, int], List[int]] = {}
+
         # ARP 泛洪去重：{(src_ip, target_ip, dpid): last_flood_time}
         # dpid 必须在键中 — 同一 ARP Request 到达不同交换机时必须分别泛洪
         self._flood_dedup: Dict[Tuple[str, str, int], float] = {}
@@ -192,6 +196,7 @@ class ArpHandler:
         with self._deployed_lock:
             snapshot = dict(self._deployed_flows)
             self._deployed_flows.clear()
+            self._dijkstra_cache.clear()  # 拓扑变更，Phase 1 路径缓存全部失效
 
         count = len(snapshot)
         redeployed = 0
@@ -601,13 +606,18 @@ class ArpHandler:
                 self._route_manager.recompute_all()
 
             # Phase 1: 纯 Dijkstra（不区分 profile，不调用 KSP+QoS）
-            path = dijkstra_shortest_path(graph, src_host.dpid, dst_host.dpid)
+            #             缓存避免同交换机对的不同 host 重复计算 Dijkstra
+            cache_key = (src_host.dpid, dst_host.dpid)
+            path = self._dijkstra_cache.get(cache_key)
             if path is None:
-                self.logger.error(
-                    f"[ArpHandler] Phase 1 Dijkstra failed for "
-                    f"{src_host.dpid}→{dst_host.dpid}"
-                )
-                return
+                path = dijkstra_shortest_path(graph, src_host.dpid, dst_host.dpid)
+                if path is None:
+                    self.logger.error(
+                        f"[ArpHandler] Phase 1 Dijkstra failed for "
+                        f"{src_host.dpid}→{dst_host.dpid}"
+                    )
+                    return
+                self._dijkstra_cache[cache_key] = path
 
             # 编译 Phase 1 流表（idle_timeout=60s，若分类结果永不回来则自动老化）
             rules = compile_path_rules(

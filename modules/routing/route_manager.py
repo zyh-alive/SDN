@@ -171,12 +171,13 @@ class RouteManager(Stalker):
             metrics = self._perf_monitor.get_latest_metrics()
             levels = self._perf_monitor.get_latest_levels()
 
-        # 更新已知交换机集合
+        # 同步已知交换机集合（从当前拓扑图全量替换，已断开交换机会自动移除）
         switches = graph.get("switches", {})
-        for _dpid_str, sw_info in switches.items():
-            dp = sw_info.get("dpid", 0)
-            if dp:
-                self._known_dpids.add(dp)
+        self._known_dpids = {
+            sw_info.get("dpid", 0)
+            for sw_info in switches.values()
+            if sw_info.get("dpid", 0)
+        }
 
         dpids = list(self._known_dpids)
         if len(dpids) < 2:

@@ -647,11 +647,19 @@ class SDNController(app_manager.RyuApp):
                 self.logger.exception(f"[LLDP] Failed to send PacketOut to {dp.id:016x}")
 
     def _start_lldp_drain_timer(self):
-        """启动 LLDP 下行队列排空定时器（100ms 间隔）"""
+        """启动 LLDP 下行队列排空定时器（信号驱动 + 兜底轮询）
+
+        LLDPCollector._send_lldp_all() 写完下行队列后置位 _downlink_ready Event，
+        本协程检测到 Event 后立刻排空；队列空时仅做 100ms 兜底休眠。
+        """
+        collector = self.lldp_collector
+
         def _timer_loop():
             while True:
-                hub.sleep(0.1)  # type: ignore[arg-type]
-                self._drain_lldp_downlink()
+                if collector._downlink_ready.is_set():
+                    self._drain_lldp_downlink()
+                else:
+                    hub.sleep(0.1)  # type: ignore[arg-type]
         hub.spawn(_timer_loop)
 
     # ──────────────────────────────────────────────

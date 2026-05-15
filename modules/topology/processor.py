@@ -697,9 +697,11 @@ class TopologyProcessor:
         # 收到 LLDP 意味着 src_dpid:src_port ← dst_dpid:dst_port
         event = self.graph.upsert_link(dst_dpid, dst_port, src_dpid, src_port)
 
-        # 8. 放入防抖窗口
+        # 8. 新链路（ADD）立即输出，不经过防抖窗口
+        #    已知链路（None）不产生事件（仅更新 last_seen）
+        #    防抖窗口保留给链路抖动场景（Producer 禁用，链路状态切换）
         if event:
-            self.debounce.add(event)
+            self._apply_events([event])
 
         return event
 
