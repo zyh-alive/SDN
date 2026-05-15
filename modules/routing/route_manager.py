@@ -80,6 +80,11 @@ class RouteManager(Stalker):
         # 路由更新回调（供 app.py 注册流表下发逻辑）
         self._on_routes_updated: Optional[Callable[[Dict[str, Any]], None]] = None
 
+        # 后台重算控制
+        self._recompute_lock = threading.Lock()
+        self._recompute_running = False
+        self._pending_recompute = False
+
         # 统计
         self._total_recomputes = 0
         self._last_recompute_time = 0.0
@@ -151,53 +156,104 @@ class RouteManager(Stalker):
 
     def recompute_all(self) -> Dict[str, Any]:
         """
-        获取最新拓扑 + 性能数据，对所有已知交换机对重算路由。
+        获取最新拓扑 + 性能数据，在后台线程中分批重算所有交换机对路由。
+
+        后台线程每计算一批 (src, dst) 对后调用 time.sleep(0) 释放 GIL，
+        确保 LLDP/ARP/OpenFlow 等其他线程不会饥饿。
 
         Returns:
-            summary dict with counts and timing
+            立即返回当前路由缓存状态的 summary
         """
         if not self._topology_graph:
             return {"error": "no topology graph", "routes": 0}
 
-        start_time = time.time()
-
-        # 获取拓扑图谱
+        # 快照当前拓扑 + 性能数据（在调用线程中获取，确保一致性）
         graph = self._topology_graph.get_full()
 
-        # 获取性能数据
         metrics: Dict[Tuple[int, int, int, int], Any] = {}
         levels: Dict[Tuple[int, int, int, int], int] = {}
         if self._perf_monitor:
             metrics = self._perf_monitor.get_latest_metrics()
             levels = self._perf_monitor.get_latest_levels()
 
-        # 同步已知交换机集合（从当前拓扑图全量替换，已断开交换机会自动移除）
+        # 同步已知交换机集合
         switches = graph.get("switches", {})
-        self._known_dpids = {
+        dpids_set = {
             sw_info.get("dpid", 0)
             for sw_info in switches.values()
             if sw_info.get("dpid", 0)
         }
+        dpids = list(dpids_set)
 
-        dpids = list(self._known_dpids)
         if len(dpids) < 2:
+            self._known_dpids = dpids_set
             self._total_recomputes += 1
-            self._last_recompute_time = time.time() - start_time
             return {"routes": 0, "switches": len(dpids), "reason": "too few switches"}
 
-        # 对所有交换机对计算路由
+        # 标记后台重算进行中；如果已有后台线程在跑，只设置 pending 标记
+        with self._recompute_lock:
+            if self._recompute_running:
+                self._pending_recompute = True
+                with self._cache_lock:
+                    current_routes = len(self._route_cache)
+                self.logger.info(
+                    "[RouteManager] Recompute already running; "
+                    "pending flag set (will re-run after current batch finishes)"
+                )
+                return {"routes": current_routes, "switches": len(dpids),
+                        "status": "pending", "reason": "recompute in progress"}
+            self._recompute_running = True
+            self._pending_recompute = False
+
+        # 启动后台线程执行计算
+        thread = threading.Thread(
+            target=self._recompute_worker,
+            args=(dpids, graph, metrics, levels),
+            name="RouteRecompute",
+            daemon=True,
+        )
+        thread.start()
+
+        # 立即返回当前状态（不阻塞调用者）
+        with self._cache_lock:
+            current_routes = len(self._route_cache)
+        return {"routes": current_routes, "switches": len(dpids),
+                "status": "started"}
+
+    def _recompute_worker(
+        self,
+        dpids: List[int],
+        graph: Dict[str, Any],
+        metrics: Dict[Tuple[int, int, int, int], Any],
+        levels: Dict[Tuple[int, int, int, int], int],
+    ) -> None:
+        """
+        后台线程：分批计算所有 (src, dst) 对的所有 profile 路由。
+
+        特性：
+          - 每 GIL_YIELD_EVERY 个源交换机后 time.sleep(0)，释放 GIL
+          - 计算完成后原子替换 _route_cache
+          - 若在计算期间有新的重算请求（_pending_recompute），
+            自动触发新一轮重算
+        """
+        GIL_YIELD_EVERY = 5  # 每处理 5 个 src 就让出 GIL
+        start_time = time.time()
+
+        self._known_dpids = set(dpids)
+
         new_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
         p0_count = 0
         p1_count = 0
 
-        for src in dpids:
+        for i, src in enumerate(dpids):
+            # ★ 分批让出 GIL：让 LLDP/ARP/OpenFlow 等其他线程有机会运行
+            if i > 0 and i % GIL_YIELD_EVERY == 0:
+                time.sleep(0)
+
             for dst in dpids:
                 if src == dst:
                     continue
 
-                # 对每种 profile 计算路由
-                # 实际使用中应该根据业务类型选择对应 profile
-                # 这里为每个 (src,dst) 预计算所有 profile 的路由
                 key = (src, dst)
                 entry: Dict[str, Any] = {"profiles": {}}
 
@@ -241,14 +297,24 @@ class RouteManager(Stalker):
             f"{elapsed*1000:.1f}ms"
         )
 
-        # 触发路由更新回调（供 app.py 执行流表编译+下发）
+        # 触发路由更新回调
         if self._on_routes_updated:
             try:
                 self._on_routes_updated(summary)
             except Exception:
                 self.logger.exception("[RouteManager] Error in _on_routes_updated callback")
 
-        return summary
+        # 检查是否有新的重算请求在计算期间到达
+        with self._recompute_lock:
+            self._recompute_running = False
+            rerun = self._pending_recompute
+            self._pending_recompute = False
+
+        if rerun:
+            self.logger.info(
+                "[RouteManager] Pending recompute detected; starting new batch..."
+            )
+            self.recompute_all()
 
     def recompute_pair(
         self, src: int, dst: int, profile: str = "other"

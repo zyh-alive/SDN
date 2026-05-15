@@ -225,14 +225,32 @@ class SDNController(app_manager.RyuApp):
         # ── Phase 4: 混合架构 — 性能数据拥堵等级变化 → 进程内回调 → RouteManager ──
         # 高频率的性能数据不经过 Redis Stream，直接进程内回调触发路由重算
         def _on_perf_change(changes: List[Dict[str, Any]]) -> None:
-            """拥堵等级变化时触发路由重算（进程内回调，高频）"""
-            if self.logger:
-                for ch in changes:
+            """拥堵等级变化时触发路由重算（进程内回调，高频）
+
+            过滤策略：
+              - level 0↔1 (NORMAL↔MILD): EWMA 噪声抖动，跳过
+              - level ≥2 (MODERATE/SEVERE): 真实拥堵或拥堵解除，全量重算 + 流表重建
+            """
+            significant: List[Dict[str, Any]] = []
+            for ch in changes:
+                old_lvl = ch.get('old_level', -1)
+                new_lvl = ch.get('new_level', -1)
+                if self.logger:
                     self.logger.info(
-                        "[app] Perf change: link %s level %d→%d",
-                        ch.get('link_id'), ch.get('old_level'), ch.get('new_level'),
+                        "[app] Perf change: link %s level %d→%d%s",
+                        ch.get('link_id'), old_lvl, new_lvl,
+                        " [SKIP]" if (new_lvl < 2 and old_lvl < 2) else "",
                     )
-            self.route_manager.recompute_all()
+                # 仅中度/重度拥堵 或 从中度/重度恢复时触发
+                if new_lvl >= 2 or old_lvl >= 2:
+                    significant.append(ch)
+
+            if significant:
+                self.logger.info(
+                    "[app] Significant congestion (%d/%d changes), recomputing routes...",
+                    len(significant), len(changes),
+                )
+                self.route_manager.recompute_all()
 
         self.perf_monitor.set_on_perf_updated(_on_perf_change)
         self.logger.info("🔄 Phase 4: PerfMonitor → RouteManager callback (in-process) registered")
