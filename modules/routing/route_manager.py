@@ -236,7 +236,19 @@ class RouteManager(Stalker):
           - 若在计算期间有新的重算请求（_pending_recompute），
             自动触发新一轮重算
         """
-        GIL_YIELD_EVERY = 5  # 每处理 5 个 src 就让出 GIL
+        # ── GIL 释放策略（防链路震荡恶性循环） ──
+        # 根因：原 GIL_YIELD_EVERY=5 在 30 交换机时每次不释放 GIL 连续计算
+        #       5×29×7=1015 次 yen_ksp（每次含 K=5 条 Dijkstra），
+        #       远超 LINK_TIMEOUT=10s，导致 LLDP 处理管线饿死 → 链路伪超时
+        #       → 虚假拓扑事件 → 新一轮重算 → 永动循环。
+        #
+        # 策略：
+        #   ① 外层每 2 个 src 让出 GIL（原 5）
+        #   ② 内层每 8 对 (src,dst) 让出 GIL（与拓扑规模解耦，
+        #      确保任何规模下 GIL 不被霸占超过 ~56 次 yen_ksp）
+        GIL_YIELD_SRC = 2        # 每处理 N 个源交换机就让出 GIL
+        PAIR_YIELD_EVERY = 8     # 每处理 N 对 (src,dst) 就让出 GIL
+
         start_time = time.time()
 
         self._known_dpids = set(dpids)
@@ -244,10 +256,11 @@ class RouteManager(Stalker):
         new_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
         p0_count = 0
         p1_count = 0
+        pair_count = 0
 
         for i, src in enumerate(dpids):
-            # ★ 分批让出 GIL：让 LLDP/ARP/OpenFlow 等其他线程有机会运行
-            if i > 0 and i % GIL_YIELD_EVERY == 0:
+            # ★ 外层：按源交换机让出 GIL
+            if i > 0 and i % GIL_YIELD_SRC == 0:
                 time.sleep(0)
 
             for dst in dpids:
@@ -275,8 +288,51 @@ class RouteManager(Stalker):
 
                 new_cache[key] = entry
 
-        # 原子替换缓存
+                # ★ 内层：按已处理的 (src,dst) 对数量让出 GIL
+                pair_count += 1
+                if pair_count % PAIR_YIELD_EVERY == 0:
+                    time.sleep(0)
+
+        # ── 比较新旧路由是否真的变了 ──
+        # 不能只比较 key set：拥塞变化时 key set 相同但 primary path 可能不同，
+        # 必须深度比较路径内容，否则拥塞触发路径 B 的流表重下发会被错误跳过。
+        routes_changed = False
         with self._cache_lock:
+            old_cache = dict(self._route_cache)  # 浅拷贝快照
+            old_keys = set(old_cache.keys())
+            new_keys = set(new_cache.keys())
+
+            if old_keys != new_keys:
+                # 拓扑变更（交换机新增/移除）→ 必须重下发
+                routes_changed = True
+            else:
+                # key set 相同 → 逐对比较 realtime profile 的 primary path
+                # （realtime 是基础 profile，所有 (src,dst) 对都有）
+                for key in old_keys:
+                    old_entry = old_cache.get(key, {})
+                    new_entry = new_cache.get(key, {})
+                    old_profiles = old_entry.get("profiles", {}) if isinstance(old_entry, dict) else {}
+                    new_profiles = new_entry.get("profiles", {}) if isinstance(new_entry, dict) else {}
+                    old_rt = old_profiles.get("realtime", {}) if isinstance(old_profiles, dict) else {}
+                    new_rt = new_profiles.get("realtime", {}) if isinstance(new_profiles, dict) else {}
+                    # 取 P0/P1 的 primary path
+                    old_path = None
+                    new_path = None
+                    if old_rt.get("is_p0"):
+                        old_path = (old_rt.get("p0") or {}).get("primary")
+                    else:
+                        old_path = (old_rt.get("p1") or {}).get("primary")
+                    if new_rt.get("is_p0"):
+                        new_path = (new_rt.get("p0") or {}).get("primary")
+                    else:
+                        new_path = (new_rt.get("p1") or {}).get("primary")
+                    old_path_list = old_path.path if old_path and hasattr(old_path, 'path') else None
+                    new_path_list = new_path.path if new_path and hasattr(new_path, 'path') else None
+                    if old_path_list != new_path_list:
+                        routes_changed = True
+                        break
+
+            # 原子替换缓存（内容始终更新到最新，即便不下发流表）
             self._route_cache = new_cache
 
         elapsed = time.time() - start_time
@@ -289,16 +345,18 @@ class RouteManager(Stalker):
             "p0_primary": p0_count,
             "p1_primary": p1_count,
             "elapsed_ms": round(elapsed * 1000, 2),
+            "routes_changed": routes_changed,
         }
 
-        self.logger.info(
-            f"[RouteManager] Recompute done: {len(dpids)} switches, "
-            f"{len(new_cache)} pairs, P0={p0_count}, P1={p1_count}, "
-            f"{elapsed*1000:.1f}ms"
-        )
+        if not routes_changed:
+            self.logger.info(
+                f"[RouteManager] Recompute done: {len(dpids)} switches, "
+                f"{len(new_cache)} pairs, P0={p0_count}, P1={p1_count} — "
+                f"NO PATH CHANGE, skip flow redeploy"
+            )
 
-        # 触发路由更新回调
-        if self._on_routes_updated:
+        # 仅在路由真的变化时才触发流表重下发
+        if routes_changed and self._on_routes_updated:
             try:
                 self._on_routes_updated(summary)
             except Exception:

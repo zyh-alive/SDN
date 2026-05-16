@@ -224,12 +224,19 @@ class SDNController(app_manager.RyuApp):
 
         # ── Phase 4: 混合架构 — 性能数据拥堵等级变化 → 进程内回调 → RouteManager ──
         # 高频率的性能数据不经过 Redis Stream，直接进程内回调触发路由重算
+        # 拥塞重算冷却：防止 EWMA 噪声触发高频重算 → GIL 竞争 → LLDP 饿死
+        # → 链路伪超时 → 虚假拓扑事件 → 新一轮重算的恶性循环。
+        # 仅在拥塞≥2 或从≥2 恢复时才允许重算，且两次重算间隔 ≥ 30s。
+        self._last_congestion_recompute: float = 0.0
+        CONGESTION_RECOMPUTE_COOLDOWN = 30.0  # 拥塞重算最小间隔（秒）
+
         def _on_perf_change(changes: List[Dict[str, Any]]) -> None:
             """拥堵等级变化时触发路由重算（进程内回调，高频）
 
             过滤策略：
               - level 0↔1 (NORMAL↔MILD): EWMA 噪声抖动，跳过
               - level ≥2 (MODERATE/SEVERE): 真实拥堵或拥堵解除，全量重算 + 流表重建
+              - 冷却期检查：两次拥塞触发的重算间隔 ≥ CONGESTION_RECOMPUTE_COOLDOWN 秒
             """
             significant: List[Dict[str, Any]] = []
             for ch in changes:
@@ -246,6 +253,19 @@ class SDNController(app_manager.RyuApp):
                     significant.append(ch)
 
             if significant:
+                now = time.time()
+                cooldown_ok = (
+                    self._last_congestion_recompute == 0.0
+                    or (now - self._last_congestion_recompute) >= CONGESTION_RECOMPUTE_COOLDOWN
+                )
+                if not cooldown_ok:
+                    self.logger.info(
+                        "[app] Congestion recompute SKIP (cooldown): %.1fs since last",
+                        now - self._last_congestion_recompute,
+                    )
+                    return
+                self._last_congestion_recompute = now
+
                 self.logger.info(
                     "[app] Significant congestion (%d/%d changes), recomputing routes...",
                     len(significant), len(changes),

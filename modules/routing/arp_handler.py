@@ -39,7 +39,11 @@ ARP_HDR_LEN = 28
 IP_HDR_MIN_LEN = 20
 
 # ARP 老化时间（秒）
-ARP_ENTRY_TTL = 300.0
+# 原值 300s 在大规模拓扑（30+ 交换机）中过短：
+#   pingall 完成时间超过 300s → 先学到的主机超时老化 → 流表失效 → 重新学习 + 重新下发，
+#   增加路由重算压力。延长至 900s（15 分钟）。
+#   活跃主机通过 _learn() 持续刷新 last_seen，不会因 TTL 延长而过期。
+ARP_ENTRY_TTL = 900.0
 
 
 class HostEntry:
@@ -111,6 +115,13 @@ class ArpHandler:
         # 拓扑变更时随 _deployed_flows 一起清空
         self._dijkstra_cache: Dict[Tuple[int, int], List[int]] = {}
 
+        # 脏循环冷却期 — 极端拓扑振荡的最后防线
+        # RouteManager._recompute_worker 已做路由变化检测（治本），冷却期仅防
+        # 链路 UP→DOWN→UP 剧烈振荡导致短时间内反复触发（例如真实链路抖动）。
+        self._COOLDOWN_SECONDS = 10            # 两次 clear_deployed_flows 最小间隔
+        self._last_deploy_cycle: float = 0.0    # 上次执行时间戳
+        self._cooldown_skipped = 0              # 冷却期跳过计数
+
         # ARP 泛洪去重：{(src_ip, target_ip, dpid): last_flood_time}
         # dpid 必须在键中 — 同一 ARP Request 到达不同交换机时必须分别泛洪
         self._flood_dedup: Dict[Tuple[str, str, int], float] = {}
@@ -170,10 +181,22 @@ class ArpHandler:
               批量下发可合并连续的 FlowMod 消息。
 
         Returns:
-            重下发前的活跃通信对数量
+             重下发前的活跃通信对数量
         """
         if not self._flow_deployer or not self._route_manager:
             return 0
+
+        # ── 冷却期检查：60s 内重复调用直接跳过（兜底保护） ──
+        now = time.time()
+        if self._last_deploy_cycle > 0 and (now - self._last_deploy_cycle) < self._COOLDOWN_SECONDS:
+            self._cooldown_skipped += 1
+            if self.logger:
+                self.logger.info(
+                    "[ArpHandler] DIRTY_CYCLE: SKIP (cooldown) — last=%.1fs ago "
+                    "skipped=%d", now - self._last_deploy_cycle, self._cooldown_skipped,
+                )
+            return 0
+        self._last_deploy_cycle = now
 
         # ── 步骤 1：清除所有交换机上的路由流表规则 ──
         hardware_cleaned = 0
@@ -201,6 +224,8 @@ class ArpHandler:
         count = len(snapshot)
         redeployed = 0
         skipped = 0
+        skipped_no_host = 0
+        skipped_no_route = 0
 
         if count > 0 and self._topology_graph:
             from modules.flow_table.compiler import (
@@ -217,6 +242,7 @@ class ArpHandler:
                     dst_host = self._lookup_ip(dst_ip)
                     if src_host is None or dst_host is None:
                         skipped += 1
+                        skipped_no_host += 1
                         continue
                     if src_host.dpid == dst_host.dpid:
                         # 同交换机：重新下发 L2 规则
@@ -234,6 +260,7 @@ class ArpHandler:
                     )
                     if route is None:
                         skipped += 1
+                        skipped_no_route += 1
                         continue
 
                     is_p0 = route.get("is_p0", False)
@@ -303,9 +330,10 @@ class ArpHandler:
 
         if self.logger:
             self.logger.info(
-                "[ArpHandler] Cleared %d DPIDs hardware + redeployed %d/%d flows "
-                "(%d skipped) (topology/perf changed)",
+                "[ArpHandler] Flow redeploy done: %d DPIDs cleaned, "
+                "redeployed=%d/%d skipped=%d (no_host=%d no_route=%d)",
                 hardware_cleaned, redeployed, count, skipped,
+                skipped_no_host, skipped_no_route,
             )
         return count
 
@@ -562,6 +590,8 @@ class ArpHandler:
             dst_host = self._lookup_ip(dst_ip)
             if src_host and dst_host:
                 self._forward_first_packet(msg, src_host, dst_host=dst_host)
+            # else: host may have aged out; _deployed_flows entry will be purged by
+            #        _clean_stale_entries() on next loop iteration
             return
 
         src_host = self._lookup_ip(src_ip)
@@ -963,7 +993,7 @@ class ArpHandler:
                 self._ip_table[ip] = mac
                 self.logger.info(
                     f"[ArpHandler] Learned: {mac} / {ip} "
-                    f"@ dpid={dpid}, port={port}"
+                    f"@ dpid={dpid}, port={port} | table_size={len(self._mac_table)}"
                 )
             else:
                 # 更新已有条目 — 仅刷新时间戳和 IP，不覆盖 dpid/port
@@ -982,18 +1012,41 @@ class ArpHandler:
         return None
 
     def _clean_stale_entries(self):
-        """清理过期的主机学习条目。"""
+        """清理过期的主机学习条目。
+
+        同步清理 _deployed_flows 中的关联条目，防止主机老化后
+        _try_deploy_flow() 因旧 flow_key 仍存在而跳过流表下发，
+        导致通信中断。
+        """
         now = time.time()
         stale_macs: List[str] = []
+        stale_ips: List[str] = []
         with self._table_lock:
             for mac, entry in self._mac_table.items():
-                if now - entry.last_seen > ARP_ENTRY_TTL:
+                age = now - entry.last_seen
+                if age > ARP_ENTRY_TTL:
                     stale_macs.append(mac)
-            for mac in stale_macs:
+                    stale_ips.append(entry.ip)
+            for mac, ip in zip(stale_macs, stale_ips):
                 entry = self._mac_table.pop(mac, None)
                 if entry:
-                    self._ip_table.pop(entry.ip, None)
-                    self.logger.debug(f"[ArpHandler] Aged out: {mac} / {entry.ip}")
+                    self._ip_table.pop(ip, None)
+
+        # ── 同步清理 _deployed_flows：移除涉及过期 IP 的通信对记录 ──
+        if stale_ips:
+            stale_ip_set = set(stale_ips)
+            with self._deployed_lock:
+                purged_keys = [
+                    (s, d) for (s, d) in self._deployed_flows
+                    if s in stale_ip_set or d in stale_ip_set
+                ]
+                for key in purged_keys:
+                    del self._deployed_flows[key]
+
+            self.logger.info(
+                "[ArpHandler] Aged out %d hosts, purged %d deployed_flows entries",
+                len(stale_macs), len(purged_keys),
+            )
 
     def _clean_flood_dedup(self):
         """清理过期的泛洪去重条目。"""
