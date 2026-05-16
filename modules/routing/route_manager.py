@@ -101,6 +101,9 @@ class RouteManager(Stalker):
         self._shm_pending_version: int = -1   # 正在轮询中的 SHM 版本号
         self._shm_poll_thread: Optional[threading.Thread] = None
 
+        # Phase 6b: ArpHandler 引用（用于提取 _deployed_flows 活跃 DPID 对）
+        self._arp_handler: Any = None
+
         # 统计
         self._total_recomputes = 0
         self._last_recompute_time = 0.0
@@ -192,6 +195,13 @@ class RouteManager(Stalker):
         """
         self._on_routes_updated = callback
 
+    def set_arp_handler(self, arp_handler: Any) -> None:
+        """
+        Phase 6b: 注入 ArpHandler 引用，用于从 _deployed_flows
+        提取活跃的 (src_dpid, dst_dpid) 对，实现按需计算。
+        """
+        self._arp_handler = arp_handler
+
     # ──────────────────────────────────────────────
     #  Stalker 接口
     # ──────────────────────────────────────────────
@@ -267,9 +277,50 @@ class RouteManager(Stalker):
             self._total_recomputes += 1
             return {"routes": 0, "switches": len(dpids), "reason": "too few switches"}
 
+        # ── Phase 6b: 按需计算 — 从 _deployed_flows 提取活跃 DPID 对 ──
+        pairs: Optional[List[Tuple[int, int]]] = None
+        cache_is_empty: bool
+        with self._cache_lock:
+            cache_is_empty = len(self._route_cache) == 0
+
+        if not cache_is_empty and self._arp_handler is not None:
+            try:
+                arp_handler = self._arp_handler
+                deployed_flows: Dict[Tuple[str, str], str]
+                with arp_handler._deployed_lock:
+                    deployed_flows = dict(arp_handler._deployed_flows)
+
+                if deployed_flows:
+                    flow_pairs: Set[Tuple[int, int]] = set()
+                    for (src_ip, dst_ip), profile in deployed_flows.items():
+                        src_host = arp_handler._lookup_ip(src_ip)
+                        dst_host = arp_handler._lookup_ip(dst_ip)
+                        if src_host is not None and dst_host is not None:
+                            if src_host.dpid != dst_host.dpid:
+                                flow_pairs.add((src_host.dpid, dst_host.dpid))
+
+                    if flow_pairs:
+                        pairs = list(flow_pairs)
+                        self.logger.info(
+                            "[RouteManager] Phase 6b on-demand: %d active DPID pairs "
+                            "(vs %d×%d full, deployed_flows=%d)",
+                            len(pairs), len(dpids), len(dpids), len(deployed_flows),
+                        )
+                    else:
+                        self.logger.debug(
+                            "[RouteManager] Phase 6b: no cross-switch pairs in "
+                            "deployed_flows, still computing %d×%d full",
+                            len(dpids), len(dpids),
+                        )
+            except Exception:
+                self.logger.debug(
+                    "[RouteManager] Phase 6b: failed to extract pairs from "
+                    "arp_handler, falling back to full computation",
+                )
+
         # ── Phase 6a: 优先尝试 SHM 多进程路径 ──
         if self._use_multiprocess and self._road_block is not None and self._road_block.healthy:
-            version = self._trigger_shm_recompute(graph, metrics, levels, dpids)
+            version = self._trigger_shm_recompute(graph, metrics, levels, dpids, pairs)
             if version >= 0:
                 # 排他：如果已有计算在进行中（SHM 或线程），标记 pending
                 with self._recompute_lock:
@@ -328,8 +379,8 @@ class RouteManager(Stalker):
 
         # 启动后台线程执行计算
         thread = threading.Thread(
-            target=self._recompute_worker,
-            args=(dpids, graph, metrics, levels),
+            target=self._fallback_thread_recompute,
+            args=(dpids, graph, metrics, levels, pairs),
             name="RouteRecompute",
             daemon=True,
         )
@@ -351,22 +402,26 @@ class RouteManager(Stalker):
         metrics: Dict[Tuple[int, int, int, int], Any],
         levels: Dict[Tuple[int, int, int, int], int],
         dpids: List[int],
+        pairs: Optional[List[Tuple[int, int]]] = None,
     ) -> int:
         """
         写入输入数据到共享内存 A，触发子进程计算。非阻塞。
+
+        Phase 6b: 新增 pairs 参数，非空时子进程按需计算指定交换机对。
 
         Args:
             graph:   从 topology_graph.get_full() 获取的拓扑图谱
             metrics: 从 perf_monitor.get_latest_metrics() 获取的性能指标
             levels:  从 perf_monitor.get_latest_levels() 获取的拥堵等级
             dpids:   已知交换机 DPID 列表
+            pairs:   活跃交换机对列表（Phase 6b 按需模式），None 时全量计算
 
         Returns:
             SHM 版本号（用于后续 poll_result 匹配），-1 表示失败
         """
         if self._road_block is None:
             return -1
-        return self._road_block.trigger(graph, metrics, levels, dpids)
+        return self._road_block.trigger(graph, metrics, levels, dpids, pairs=pairs)
 
     def _poll_shm_loop(self, expected_version: int, dpids: List[int]) -> None:
         """
@@ -519,26 +574,37 @@ class RouteManager(Stalker):
                 self._fallback_thread_recompute(dpids)
                 return
 
-    def _fallback_thread_recompute(self, dpids: List[int]) -> None:
+    def _fallback_thread_recompute(
+        self,
+        dpids: List[int],
+        graph: Optional[Dict[str, Any]] = None,
+        metrics: Optional[Dict[Tuple[int, int, int, int], Any]] = None,
+        levels: Optional[Dict[Tuple[int, int, int, int], int]] = None,
+        pairs: Optional[List[Tuple[int, int]]] = None,
+    ) -> None:
         """
         降级回线程模式重算 — 当子进程异常或超时时调用。
 
-        重新快照 topology + performance 数据并调用 _recompute_worker()。
+        Phase 6b: 接受可选的 graph/metrics/levels/pairs 参数。
+          - 若调用方已传入 → 直接复用（避免重复快照）
+          - 若未传入（legacy 路径） → 自行快照 topology + performance 数据
         """
-        graph: Dict[str, Any] = {}
-        metrics: Dict[Tuple[int, int, int, int], Any] = {}
-        levels: Dict[Tuple[int, int, int, int], int] = {}
+        # 确保 graph/metrics/levels 非 None（调用方可能只传 dpids）
+        g: Dict[str, Any] = graph if graph is not None else {}
+        m: Dict[Tuple[int, int, int, int], Any] = metrics if metrics is not None else {}
+        l: Dict[Tuple[int, int, int, int], int] = levels if levels is not None else {}
 
-        try:
-            if self._topology_graph:
-                graph = self._topology_graph.get_full()
-            if self._perf_monitor:
-                metrics = self._perf_monitor.get_latest_metrics()
-                levels = self._perf_monitor.get_latest_levels()
-        except Exception:
-            self.logger.exception("[RouteManager] Failed to snapshot for fallback")
+        if not g or not m or not l:
+            try:
+                if self._topology_graph and not g:
+                    g = self._topology_graph.get_full()
+                if self._perf_monitor and (not m or not l):
+                    m = self._perf_monitor.get_latest_metrics()
+                    l = self._perf_monitor.get_latest_levels()
+            except Exception:
+                self.logger.exception("[RouteManager] Failed to snapshot for fallback")
 
-        self._recompute_worker(dpids, graph, metrics, levels)
+        self._recompute_worker(dpids, g, m, l, pairs)
 
     # ──────────────────────────────────────────────
     #  线程模式重算 worker（GIL 友好 + 保留作为 fallback）
@@ -550,9 +616,14 @@ class RouteManager(Stalker):
         graph: Dict[str, Any],
         metrics: Dict[Tuple[int, int, int, int], Any],
         levels: Dict[Tuple[int, int, int, int], int],
+        pairs: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
         """
-        后台线程：分批计算所有 (src, dst) 对的所有 profile 路由。
+        后台线程：计算指定 (src, dst) 对的所有 profile 路由。
+
+        Phase 6b: 新增 pairs 参数。
+          - pairs 非空 → 按需计算指定交换机对
+          - pairs 为 None → 全量预计算（首次启动/降级）
 
         特性：
           - 每 GIL_YIELD_EVERY 个源交换机后 time.sleep(0)，释放 GIL
@@ -582,18 +653,17 @@ class RouteManager(Stalker):
         p1_count = 0
         pair_count = 0
 
-        for i, src in enumerate(dpids):
-            # ★ 外层：按源交换机让出 GIL
-            if i > 0 and i % GIL_YIELD_SRC == 0:
-                time.sleep(0)
-
-            for dst in dpids:
+        if pairs is not None and len(pairs) > 0:
+            # ── Phase 6b: 按需模式 — 只计算活跃交换机对 ──
+            self.logger.info(
+                "Phase 6b on-demand (thread): computing %d active pairs "
+                "(vs %d×%d full)", len(pairs), len(dpids), len(dpids),
+            )
+            for src, dst in pairs:
                 if src == dst:
                     continue
-
                 key = (src, dst)
                 entry: Dict[str, Any] = {"profiles": {}}
-
                 for profile in self.P0_PROFILES | self.P1_PROFILES:
                     result = self._calculator.compute(
                         graph=graph,
@@ -604,18 +674,47 @@ class RouteManager(Stalker):
                         levels=levels,
                     )
                     entry["profiles"][profile] = result
-
                     if result.get("is_p0") and result["p0"]["primary"]:
                         p0_count += 1
                     elif result["p1"]["primary"]:
                         p1_count += 1
-
                 new_cache[key] = entry
-
-                # ★ 内层：按已处理的 (src,dst) 对数量让出 GIL
-                pair_count += 1
-                if pair_count % PAIR_YIELD_EVERY == 0:
+        else:
+            # ── 全量模式（首次启动/降级）: 全对全计算 ──
+            for i, src in enumerate(dpids):
+                # ★ 外层：按源交换机让出 GIL
+                if i > 0 and i % GIL_YIELD_SRC == 0:
                     time.sleep(0)
+
+                for dst in dpids:
+                    if src == dst:
+                        continue
+
+                    key = (src, dst)
+                    entry: Dict[str, Any] = {"profiles": {}}
+
+                    for profile in self.P0_PROFILES | self.P1_PROFILES:
+                        result = self._calculator.compute(
+                            graph=graph,
+                            src=src,
+                            dst=dst,
+                            profile=profile,
+                            metrics=metrics,
+                            levels=levels,
+                        )
+                        entry["profiles"][profile] = result
+
+                        if result.get("is_p0") and result["p0"]["primary"]:
+                            p0_count += 1
+                        elif result["p1"]["primary"]:
+                            p1_count += 1
+
+                    new_cache[key] = entry
+
+                    # ★ 内层：按已处理的 (src,dst) 对数量让出 GIL
+                    pair_count += 1
+                    if pair_count % PAIR_YIELD_EVERY == 0:
+                        time.sleep(0)
 
         # ── 比较新旧路由是否真的变了 ──
         # 不能只比较 key set：拥塞变化时 key set 相同但 primary path 可能不同，
@@ -703,7 +802,9 @@ class RouteManager(Stalker):
         self, src: int, dst: int, profile: str = "other"
     ) -> Optional[Dict[str, Any]]:
         """
-        对单个 (src, dst) 对重算路由。
+        对单个 (src, dst) 对重算路由，并将结果写入 _route_cache。
+
+        Phase 6b: cache miss 时由 ArpHandler 精准触发，只算缺失的对。
 
         Args:
             src:     源交换机 DPID
@@ -720,7 +821,7 @@ class RouteManager(Stalker):
         metrics: Dict[Tuple[int, int, int, int], Any] = self._perf_monitor.get_latest_metrics() if self._perf_monitor else {}
         levels: Dict[Tuple[int, int, int, int], int] = self._perf_monitor.get_latest_levels() if self._perf_monitor else {}
 
-        return self._calculator.compute(
+        result = self._calculator.compute(
             graph=graph,
             src=src,
             dst=dst,
@@ -728,6 +829,21 @@ class RouteManager(Stalker):
             metrics=metrics,
             levels=levels,
         )
+
+        # Phase 6b: 将单对计算结果写入缓存，供后续 get_route() 命中
+        if result is not None:
+            with self._cache_lock:
+                entry = self._route_cache.get((src, dst))
+                if entry is None:
+                    entry = {"profiles": {}}
+                entry_profiles: Dict[str, Any] = entry.get("profiles", {})
+                if not isinstance(entry_profiles, dict):
+                    entry_profiles = {}
+                entry_profiles[profile] = result
+                entry["profiles"] = entry_profiles
+                self._route_cache[(src, dst)] = entry
+
+        return result
 
     # ──────────────────────────────────────────────
     #  缓存查询（供流表下发/北向接口使用）

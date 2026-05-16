@@ -190,6 +190,8 @@ class SDNController(app_manager.RyuApp):
             logger=self.logger,
         )
         self.arp_handler.start()
+        # Phase 6b: 注入 ArpHandler 引用供按需计算使用
+        self.route_manager.set_arp_handler(self.arp_handler)
         self.logger.info("📡 Phase 4: ArpHandler started (via Worker west-queue pipeline)")
 
         # 启动拓扑消费线程（从 topo_east_queue 消费 LLDP 消息送入 processor）
@@ -226,9 +228,15 @@ class SDNController(app_manager.RyuApp):
         # 高频率的性能数据不经过 Redis Stream，直接进程内回调触发路由重算
         # 拥塞重算冷却：防止 EWMA 噪声触发高频重算 → GIL 竞争 → LLDP 饿死
         # → 链路伪超时 → 虚假拓扑事件 → 新一轮重算的恶性循环。
-        # 仅在拥塞≥2 或从≥2 恢复时才允许重算，且两次重算间隔 ≥ 30s。
+        # 仅在拥塞≥2 或从≥2 恢复时才允许重算。
+        #
+        # 方向感知自适应冷却期（v2）：
+        #   - 拥塞恶化 (new > old): 冷却 5s  — 快速响应微突发，避免丢包窗口过长
+        #   - 拥塞恢复 (new < old): 冷却 15s — 验证稳定性后再切回，防止路径震荡
         self._last_congestion_recompute: float = 0.0
-        CONGESTION_RECOMPUTE_COOLDOWN = 30.0  # 拥塞重算最小间隔（秒）
+        CONGESTION_COOLDOWN_WORSEN = 5.0   # 恶化方向：快速响应
+        CONGESTION_COOLDOWN_RECOVER = 15.0  # 恢复方向：验证稳定性
+        CONGESTION_COOLDOWN_DEFAULT = 10.0  # 混合方向：折中
 
         def _on_perf_change(changes: List[Dict[str, Any]]) -> None:
             """拥堵等级变化时触发路由重算（进程内回调，高频）
@@ -236,9 +244,11 @@ class SDNController(app_manager.RyuApp):
             过滤策略：
               - level 0↔1 (NORMAL↔MILD): EWMA 噪声抖动，跳过
               - level ≥2 (MODERATE/SEVERE): 真实拥堵或拥堵解除，全量重算 + 流表重建
-              - 冷却期检查：两次拥塞触发的重算间隔 ≥ CONGESTION_RECOMPUTE_COOLDOWN 秒
+              - 方向感知冷却期：恶化 5s / 恢复 15s / 混合 10s
             """
             significant: List[Dict[str, Any]] = []
+            any_worsening = False
+            any_recovering = False
             for ch in changes:
                 old_lvl = ch.get('old_level', -1)
                 new_lvl = ch.get('new_level', -1)
@@ -251,24 +261,42 @@ class SDNController(app_manager.RyuApp):
                 # 仅中度/重度拥堵 或 从中度/重度恢复时触发
                 if new_lvl >= 2 or old_lvl >= 2:
                     significant.append(ch)
+                    if new_lvl > old_lvl:
+                        any_worsening = True
+                    elif new_lvl < old_lvl:
+                        any_recovering = True
 
             if significant:
                 now = time.time()
+                # ── 方向感知自适应冷却期 ──
+                if any_worsening and any_recovering:
+                    effective_cooldown = CONGESTION_COOLDOWN_DEFAULT
+                    direction_tag = "mixed"
+                elif any_worsening:
+                    effective_cooldown = CONGESTION_COOLDOWN_WORSEN
+                    direction_tag = "worsen"
+                else:
+                    effective_cooldown = CONGESTION_COOLDOWN_RECOVER
+                    direction_tag = "recover"
+
                 cooldown_ok = (
                     self._last_congestion_recompute == 0.0
-                    or (now - self._last_congestion_recompute) >= CONGESTION_RECOMPUTE_COOLDOWN
+                    or (now - self._last_congestion_recompute) >= effective_cooldown
                 )
                 if not cooldown_ok:
                     self.logger.info(
-                        "[app] Congestion recompute SKIP (cooldown): %.1fs since last",
+                        "[app] Congestion recompute SKIP (cooldown=%s/%.0fs): "
+                        "%.1fs since last",
+                        direction_tag, effective_cooldown,
                         now - self._last_congestion_recompute,
                     )
                     return
                 self._last_congestion_recompute = now
 
                 self.logger.info(
-                    "[app] Significant congestion (%d/%d changes), recomputing routes...",
-                    len(significant), len(changes),
+                    "[app] Significant congestion (%s, %d/%d changes), "
+                    "recomputing routes...",
+                    direction_tag, len(significant), len(changes),
                 )
                 self.route_manager.recompute_all()
 

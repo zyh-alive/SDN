@@ -437,19 +437,15 @@ def _road_block_worker(
             levels_raw = input_data.get("levels", {})
             levels = _deserialize_levels(levels_raw)
             dpids = input_data.get("dpids", [])
+            pairs_raw = input_data.get("pairs", None)  # Phase 6b: 按需计算对列表
 
-            if len(dpids) < 2:
-                worker_logger.info("Too few dpids (%d), skip compute", len(dpids))
+            if len(dpids) < 2 and pairs_raw is None:
+                worker_logger.info("Too few dpids (%d) and no pairs, skip compute", len(dpids))
                 continue
 
-            # ── 全对全 KSP+QoS 计算 ──
-            num_pairs = len(dpids) * (len(dpids) - 1)
-            worker_logger.info(
-                "Computing routes: %d switches → %d pairs...",
-                len(dpids), num_pairs,
-            )
+            # ── KSP+QoS 计算（Phase 6b: 按需/全量双模） ──
+            calculator = RouteCalculator(logger=worker_logger, k=5)
             t0 = time.time()
-
             new_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
             p0_count = 0
             p1_count = 0
@@ -458,21 +454,26 @@ def _road_block_worker(
             P1_PROFILES = {"streaming", "bulk", "other"}
             ALL_PROFILES = P0_PROFILES | P1_PROFILES
 
-            for src in dpids:
-                for dst in dpids:
+            if pairs_raw is not None:
+                # ── Phase 6b: 按需模式 — 只计算活跃交换机对 ──
+                pairs: List[Tuple[int, int]] = [
+                    (int(p[0]), int(p[1]))
+                    for p in pairs_raw
+                    if isinstance(p, (list, tuple)) and len(p) == 2
+                ]
+                worker_logger.info(
+                    "Phase 6b on-demand: computing %d active pairs (vs %d×%d full)",
+                    len(pairs), len(dpids), len(dpids),
+                )
+                for src, dst in pairs:
                     if src == dst:
                         continue
-
                     entry: Dict[str, Any] = {"profiles": {}}
                     for profile in ALL_PROFILES:
                         try:
                             result = calculator.compute(
-                                graph=graph,
-                                src=src,
-                                dst=dst,
-                                profile=profile,
-                                metrics=metrics,
-                                levels=levels,
+                                graph=graph, src=src, dst=dst,
+                                profile=profile, metrics=metrics, levels=levels,
                             )
                         except Exception:
                             worker_logger.exception(
@@ -480,15 +481,42 @@ def _road_block_worker(
                                 src, dst, profile,
                             )
                             result = calculator._empty_result(profile)
-
                         entry["profiles"][profile] = result
-
                         if result.get("is_p0") and result.get("p0", {}).get("primary"):
                             p0_count += 1
                         elif result.get("p1", {}).get("primary"):
                             p1_count += 1
-
                     new_cache[(src, dst)] = entry
+            else:
+                # ── 全量模式（首次启动/降级）: 全对全计算 ──
+                num_pairs = len(dpids) * (len(dpids) - 1)
+                worker_logger.info(
+                    "Computing routes: %d switches → %d pairs (full)...",
+                    len(dpids), num_pairs,
+                )
+                for src in dpids:
+                    for dst in dpids:
+                        if src == dst:
+                            continue
+                        entry: Dict[str, Any] = {"profiles": {}}
+                        for profile in ALL_PROFILES:
+                            try:
+                                result = calculator.compute(
+                                    graph=graph, src=src, dst=dst,
+                                    profile=profile, metrics=metrics, levels=levels,
+                                )
+                            except Exception:
+                                worker_logger.exception(
+                                    "Compute failed for %d→%d profile=%s",
+                                    src, dst, profile,
+                                )
+                                result = calculator._empty_result(profile)
+                            entry["profiles"][profile] = result
+                            if result.get("is_p0") and result.get("p0", {}).get("primary"):
+                                p0_count += 1
+                            elif result.get("p1", {}).get("primary"):
+                                p1_count += 1
+                        new_cache[(src, dst)] = entry
 
             elapsed_ms = int((time.time() - t0) * 1000)
 
@@ -716,9 +744,20 @@ class RoadBlockCore:
         metrics: Dict[Tuple[int, int, int, int], Any],
         levels: Dict[Tuple[int, int, int, int], int],
         dpids: List[int],
+        pairs: Optional[List[Tuple[int, int]]] = None,
     ) -> int:
         """
         写入输入数据到 SHM A，触发子进程计算。非阻塞。
+
+        Phase 6b: 新增 pairs 参数，非空时子进程按需计算指定交换机对，
+        为空时保持全量全对全计算。
+
+        Args:
+            graph:   拓扑图谱
+            metrics: 性能指标
+            levels:  拥堵等级
+            dpids:   已知交换机 DPID 列表
+            pairs:   活跃交换机对列表（Phase 6b 按需模式），None 时全量计算
 
         Returns:
             新的 version 号（用于后续 poll_result 匹配），-1 表示失败
@@ -746,6 +785,15 @@ class RoadBlockCore:
                 "levels": levels_serialized,
                 "dpids": dpids,
             }
+
+            # Phase 6b: 按需计算 — 只传递活跃交换机对列表
+            if pairs is not None and len(pairs) > 0:
+                input_data["pairs"] = [
+                    [int(src), int(dst)] for src, dst in pairs
+                ]
+                self.logger.debug(
+                    "[RoadBlockCore] On-demand mode: %d active pairs", len(pairs),
+                )
 
             json_str = json.dumps(input_data, ensure_ascii=False)
             json_bytes = json_str.encode("utf-8")

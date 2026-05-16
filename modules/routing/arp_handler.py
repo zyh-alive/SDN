@@ -633,7 +633,10 @@ class ArpHandler:
                     f"{src_host.dpid}→{dst_host.dpid}, "
                     f"triggering on-demand recompute..."
                 )
-                self._route_manager.recompute_all()
+                # Phase 6b: 精准按需重算，仅计算缺失的 (src,dst) 对
+                route = self._route_manager.recompute_pair(
+                    src_host.dpid, dst_host.dpid, profile="realtime"
+                )
 
             # Phase 1: 纯 Dijkstra（不区分 profile，不调用 KSP+QoS）
             #             缓存避免同交换机对的不同 host 重复计算 Dijkstra
