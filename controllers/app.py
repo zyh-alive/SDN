@@ -281,6 +281,12 @@ class SDNController(app_manager.RyuApp):
         self.route_manager.set_on_routes_updated(self._on_routes_updated)
         self.logger.info("🔄 Phase 4: RouteManager dependency injection + topology-change callback registered")
 
+        # ── Phase 6a: 多进程 KSP 路由计算引擎（优雅降级） ──
+        # 在依赖注入完成后初始化（必须在 eventlet monkey-patch 之前 import multiprocessing）。
+        # 如果初始化失败，自动 fallback 到线程模式，不影响控制器正常运行。
+        self.route_manager.init_multiprocess()
+        self.logger.info("🚀 Phase 6a: Multiprocess KSP engine init attempted")
+
         # ── Phase 5: 流量分类模块（朴素贝叶斯五分类 + 冷启动伪标签 + 增量训练） ──
         # 数据流: Worker(IP packets) → classification_queue → FlowTracker → Classifier
         #           → Redis class:result:{flow_key} + MySQL flow_class_log

@@ -17,6 +17,16 @@ RouteManager — 路由管理协调器（Stalker 盯梢者）
           → perf_monitor.get_latest_metrics() / get_latest_levels()
           → RouteCalculator.compute(src, dst, profile=...)
 
+Phase 6a 多进程扩展：
+  recompute_all()
+    → 若 _road_block 健康 → _trigger_shm_recompute() 写入 SHM A（非阻塞）
+    → 后台轮询线程 _poll_shm_loop() → poll_result() → 反序列化 → 更新缓存 → 回调
+    → 若 _road_block 不健康 → 自动降级到 _recompute_worker() 线程模式
+
+触发源（兼覆盖拓扑变更和性能检测）：
+  Path A — 拓扑变更: StalkerManager → on_events() → recompute_all()
+  Path B — 拥堵变化: app._on_perf_change() → recompute_all()
+
 遵循"一个功能一个文件"原则 — 本文件仅做协调，不实现具体算法。
 """
 
@@ -85,9 +95,75 @@ class RouteManager(Stalker):
         self._recompute_running = False
         self._pending_recompute = False
 
+        # Phase 6a: 多进程 KSP 计算引擎（共享内存桥接）
+        self._road_block: Any = None          # RoadBlockCore 实例（延迟初始化）
+        self._use_multiprocess: bool = False  # 当前是否使用多进程模式
+        self._shm_pending_version: int = -1   # 正在轮询中的 SHM 版本号
+        self._shm_poll_thread: Optional[threading.Thread] = None
+
         # 统计
         self._total_recomputes = 0
         self._last_recompute_time = 0.0
+
+    # ──────────────────────────────────────────────
+    #  Phase 6a: 多进程引擎初始化/销毁
+    # ──────────────────────────────────────────────
+
+    def init_multiprocess(self) -> bool:
+        """
+        初始化多进程 KSP 计算引擎。
+
+        在 app.py 初始化阶段调用（必须在 eventlet monkey-patch 之前 import multiprocessing）。
+        如果初始化失败（非 Linux 或缺少 shared_memory），自动 fallback 到线程模式，
+        不影响控制器正常运行。
+
+        Returns:
+            True 表示多进程模式已启用并健康
+        """
+        if self._road_block is not None:
+            return self._use_multiprocess
+
+        try:
+            from modules.routing.road_block_core import RoadBlockCore
+
+            self._road_block = RoadBlockCore(logger=self.logger)
+            ok = self._road_block.start()
+            if ok:
+                self._use_multiprocess = True
+                self.logger.info(
+                    "[RouteManager] ✅ Multiprocess mode ENABLED — "
+                    "KSP computation offloaded to child process via SHM"
+                )
+                return True
+            else:
+                self.logger.warning(
+                    "[RouteManager] ⚠️  RoadBlockCore.start() failed — "
+                    "falling back to thread mode"
+                )
+                self._use_multiprocess = False
+                return False
+        except ImportError as e:
+            self.logger.warning(
+                "[RouteManager] ⚠️  RoadBlockCore import failed (%s) — "
+                "falling back to thread mode", e,
+            )
+            self._use_multiprocess = False
+            return False
+        except Exception:
+            self.logger.exception(
+                "[RouteManager] ⚠️  RoadBlockCore init exception — "
+                "falling back to thread mode"
+            )
+            self._use_multiprocess = False
+            return False
+
+    def shutdown_multiprocess(self) -> None:
+        """关闭多进程引擎（控制器退出时调用）。"""
+        if self._road_block is not None:
+            self.logger.info("[RouteManager] Shutting down multiprocess engine...")
+            self._road_block.stop()
+            self._road_block = None
+            self._use_multiprocess = False
 
     # ──────────────────────────────────────────────
     #  依赖注入（构造函数之外的可选注入）
@@ -151,18 +227,19 @@ class RouteManager(Stalker):
         return self.recompute_all()
 
     # ──────────────────────────────────────────────
-    #  路由重算
+    #  路由重算（Phase 6a 双路径：SHM 多进程 / 线程 fallback）
     # ──────────────────────────────────────────────
 
     def recompute_all(self) -> Dict[str, Any]:
         """
-        获取最新拓扑 + 性能数据，在后台线程中分批重算所有交换机对路由。
+        获取最新拓扑 + 性能数据，在子进程或后台线程中重算所有交换机对路由。
 
-        后台线程每计算一批 (src, dst) 对后调用 time.sleep(0) 释放 GIL，
-        确保 LLDP/ARP/OpenFlow 等其他线程不会饥饿。
+        Phase 6a 双路径策略：
+          1. 若多进程引擎健康 → _trigger_shm_recompute() → 轮询线程 _poll_shm_loop()
+          2. 若多进程不健康/触发失败 → 自动降级到 _recompute_worker() 线程模式
 
         Returns:
-            立即返回当前路由缓存状态的 summary
+            立即返回当前路由缓存状态的 summary（不阻塞调用者）
         """
         if not self._topology_graph:
             return {"error": "no topology graph", "routes": 0}
@@ -190,7 +267,51 @@ class RouteManager(Stalker):
             self._total_recomputes += 1
             return {"routes": 0, "switches": len(dpids), "reason": "too few switches"}
 
-        # 标记后台重算进行中；如果已有后台线程在跑，只设置 pending 标记
+        # ── Phase 6a: 优先尝试 SHM 多进程路径 ──
+        if self._use_multiprocess and self._road_block is not None and self._road_block.healthy:
+            version = self._trigger_shm_recompute(graph, metrics, levels, dpids)
+            if version >= 0:
+                # 排他：如果已有计算在进行中（SHM 或线程），标记 pending
+                with self._recompute_lock:
+                    if self._recompute_running:
+                        self._pending_recompute = True
+                        with self._cache_lock:
+                            current_routes = len(self._route_cache)
+                        self.logger.info(
+                            "[RouteManager] SHM recompute already running; "
+                            "pending flag set"
+                        )
+                        return {"routes": current_routes, "switches": len(dpids),
+                                "status": "pending", "reason": "SHM recompute in progress"}
+                    self._recompute_running = True
+                    self._pending_recompute = False
+
+                self._shm_pending_version = version
+                poll_thread = threading.Thread(
+                    target=self._poll_shm_loop,
+                    args=(version, dpids),
+                    name="ShmPollLoop",
+                    daemon=True,
+                )
+                poll_thread.start()
+                self._shm_poll_thread = poll_thread
+
+                with self._cache_lock:
+                    current_routes = len(self._route_cache)
+                self.logger.info(
+                    "[RouteManager] SHM recompute v%d dispatched for %d switches",
+                    version, len(dpids),
+                )
+                return {"routes": current_routes, "switches": len(dpids),
+                        "status": "started_shm", "version": version}
+            else:
+                # SHM trigger 失败 → 自动降级到线程模式
+                self.logger.warning(
+                    "[RouteManager] SHM trigger failed (version=%d), "
+                    "falling back to thread mode", version,
+                )
+
+        # ── 线程模式（fallback 或 多进程未启用） ──
         with self._recompute_lock:
             if self._recompute_running:
                 self._pending_recompute = True
@@ -219,6 +340,209 @@ class RouteManager(Stalker):
             current_routes = len(self._route_cache)
         return {"routes": current_routes, "switches": len(dpids),
                 "status": "started"}
+
+    # ──────────────────────────────────────────────
+    #  Phase 6a: SHM 多进程方法
+    # ──────────────────────────────────────────────
+
+    def _trigger_shm_recompute(
+        self,
+        graph: Dict[str, Any],
+        metrics: Dict[Tuple[int, int, int, int], Any],
+        levels: Dict[Tuple[int, int, int, int], int],
+        dpids: List[int],
+    ) -> int:
+        """
+        写入输入数据到共享内存 A，触发子进程计算。非阻塞。
+
+        Args:
+            graph:   从 topology_graph.get_full() 获取的拓扑图谱
+            metrics: 从 perf_monitor.get_latest_metrics() 获取的性能指标
+            levels:  从 perf_monitor.get_latest_levels() 获取的拥堵等级
+            dpids:   已知交换机 DPID 列表
+
+        Returns:
+            SHM 版本号（用于后续 poll_result 匹配），-1 表示失败
+        """
+        if self._road_block is None:
+            return -1
+        return self._road_block.trigger(graph, metrics, levels, dpids)
+
+    def _poll_shm_loop(self, expected_version: int, dpids: List[int]) -> None:
+        """
+        后台线程：轮询共享内存 B 获取子进程计算结果。
+
+        每 50ms 调用 road_block.poll_result() 检查状态。
+        成功获取结果后：
+          1. 深度比较新旧路由是否变化
+          2. 原子替换 _route_cache
+          3. 若 routes_changed → 触发 _on_routes_updated 回调
+          4. 检查 pending flag 是否需要自动重算
+
+        异常处理：
+          - 子进程崩溃 → _road_block.healthy 变为 False → 降级到 _recompute_worker()
+          - 超时 (COMPUTE_TIMEOUT) → 降级到 _recompute_worker()
+        """
+        start_time = time.time()
+        POLL_INTERVAL = 0.05       # 50ms 与子进程轮询同频
+        COMPUTE_TIMEOUT = 300.0    # 5 分钟超时保护
+
+        while True:
+            time.sleep(POLL_INTERVAL)
+
+            # 检查子进程是否已崩溃
+            if self._road_block is None or not self._road_block.healthy:
+                self.logger.error(
+                    "[RouteManager] RoadBlockCore became unhealthy during poll, "
+                    "falling back to thread mode"
+                )
+                self._shm_pending_version = -1
+                self._fallback_thread_recompute(dpids)
+                return
+
+            # 非阻塞轮询
+            result = self._road_block.poll_result(expected_version, timeout=0.0)
+
+            if result is not None:
+                # ── 成功获取子进程计算结果 ──
+                routes = result.get("routes", {})
+                p0_count = result.get("p0_count", 0)
+                p1_count = result.get("p1_count", 0)
+                switches_count = result.get("switches", len(dpids))
+                elapsed_ms = result.get("elapsed_ms", 0)
+
+                # 更新已知交换机集合（在 SHM 路径中也需要维护）
+                self._known_dpids = set(dpids)
+
+                # ── 深度比较新旧路由是否变化 ──
+                # 不能只比较 key set：拥塞变化时 key set 相同但 primary path 可能不同，
+                # 必须深度比较路径内容，否则拥塞触发路径 B 的流表重下发会被错误跳过。
+                routes_changed = False
+                with self._cache_lock:
+                    old_cache = dict(self._route_cache)
+                    old_keys = set(old_cache.keys())
+                    new_keys = set(routes.keys())
+
+                    if old_keys != new_keys:
+                        routes_changed = True
+                    else:
+                        for key in old_keys:
+                            old_entry = old_cache.get(key, {})
+                            new_entry = routes.get(key, {})
+                            old_profiles = old_entry.get("profiles", {}) if isinstance(old_entry, dict) else {}
+                            new_profiles = new_entry.get("profiles", {}) if isinstance(new_entry, dict) else {}
+                            old_rt = old_profiles.get("realtime", {}) if isinstance(old_profiles, dict) else {}
+                            new_rt = new_profiles.get("realtime", {}) if isinstance(new_profiles, dict) else {}
+                            old_path = None
+                            new_path = None
+                            if old_rt.get("is_p0"):
+                                old_path = (old_rt.get("p0") or {}).get("primary")
+                            else:
+                                old_path = (old_rt.get("p1") or {}).get("primary")
+                            if new_rt.get("is_p0"):
+                                new_path = (new_rt.get("p0") or {}).get("primary")
+                            else:
+                                new_path = (new_rt.get("p1") or {}).get("primary")
+                            old_path_list = old_path.path if old_path and hasattr(old_path, 'path') else None
+                            new_path_list = new_path.path if new_path and hasattr(new_path, 'path') else None
+                            if old_path_list != new_path_list:
+                                routes_changed = True
+                                break
+
+                    # 原子替换缓存
+                    self._route_cache = routes
+
+                elapsed = time.time() - start_time
+                # 优先使用子进程自身测量的耗时（不含序列化/轮询开销）
+                compute_time = elapsed if elapsed_ms == 0 else (elapsed_ms / 1000.0)
+                self._total_recomputes += 1
+                self._last_recompute_time = compute_time
+
+                summary: Dict[str, Any] = {
+                    "routes": len(routes),
+                    "switches": switches_count,
+                    "p0_primary": p0_count,
+                    "p1_primary": p1_count,
+                    "elapsed_ms": round(compute_time * 1000, 2),
+                    "routes_changed": routes_changed,
+                    "mode": "multiprocess",
+                }
+
+                if not routes_changed:
+                    self.logger.info(
+                        f"[RouteManager] SHM Recompute done: {switches_count} switches, "
+                        f"{len(routes)} pairs, P0={p0_count}, P1={p1_count} — "
+                        f"NO PATH CHANGE, skip flow redeploy"
+                    )
+                else:
+                    self.logger.info(
+                        f"[RouteManager] SHM Recompute done: {switches_count} switches, "
+                        f"{len(routes)} pairs, P0={p0_count}, P1={p1_count}, "
+                        f"elapsed={round(compute_time * 1000, 2)}ms — CHANGED"
+                    )
+
+                # 仅在路由真的变化时才触发流表重下发
+                if routes_changed and self._on_routes_updated:
+                    try:
+                        self._on_routes_updated(summary)
+                    except Exception:
+                        self.logger.exception(
+                            "[RouteManager] Error in _on_routes_updated callback (SHM path)"
+                        )
+
+                # 检查是否有新的重算请求在计算期间到达
+                with self._recompute_lock:
+                    self._recompute_running = False
+                    rerun = self._pending_recompute
+                    self._pending_recompute = False
+
+                self._shm_pending_version = -1
+
+                if rerun:
+                    self.logger.info(
+                        "[RouteManager] Pending recompute detected; "
+                        "starting new round (SHM path)..."
+                    )
+                    self.recompute_all()
+
+                return
+
+            # 超时检查：子进程可能陷入死循环或崩溃未退出
+            if time.time() - start_time > COMPUTE_TIMEOUT:
+                self.logger.error(
+                    "[RouteManager] SHM recompute timeout after %.0fs, "
+                    "falling back to thread mode", COMPUTE_TIMEOUT,
+                )
+                self._shm_pending_version = -1
+                with self._recompute_lock:
+                    self._recompute_running = False
+                self._fallback_thread_recompute(dpids)
+                return
+
+    def _fallback_thread_recompute(self, dpids: List[int]) -> None:
+        """
+        降级回线程模式重算 — 当子进程异常或超时时调用。
+
+        重新快照 topology + performance 数据并调用 _recompute_worker()。
+        """
+        graph: Dict[str, Any] = {}
+        metrics: Dict[Tuple[int, int, int, int], Any] = {}
+        levels: Dict[Tuple[int, int, int, int], int] = {}
+
+        try:
+            if self._topology_graph:
+                graph = self._topology_graph.get_full()
+            if self._perf_monitor:
+                metrics = self._perf_monitor.get_latest_metrics()
+                levels = self._perf_monitor.get_latest_levels()
+        except Exception:
+            self.logger.exception("[RouteManager] Failed to snapshot for fallback")
+
+        self._recompute_worker(dpids, graph, metrics, levels)
+
+    # ──────────────────────────────────────────────
+    #  线程模式重算 worker（GIL 友好 + 保留作为 fallback）
+    # ──────────────────────────────────────────────
 
     def _recompute_worker(
         self,
@@ -346,6 +670,7 @@ class RouteManager(Stalker):
             "p1_primary": p1_count,
             "elapsed_ms": round(elapsed * 1000, 2),
             "routes_changed": routes_changed,
+            "mode": "thread",
         }
 
         if not routes_changed:
@@ -442,13 +767,28 @@ class RouteManager(Stalker):
     def stats(self) -> Dict[str, Any]:
         with self._cache_lock:
             cache_size = len(self._route_cache)
-        return {
+
+        result: Dict[str, Any] = {
             "total_recomputes": self._total_recomputes,
             "last_recompute_ms": round(self._last_recompute_time * 1000, 2),
             "cached_pairs": cache_size,
             "known_switches": len(self._known_dpids),
             "calculator": self._calculator.stats(),
+            "multiprocess": {
+                "enabled": self._use_multiprocess,
+                "healthy": self._road_block.healthy if self._road_block else False,
+            },
         }
+
+        # 附加 RoadBlockCore 内部统计（如果可用）
+        if self._road_block is not None:
+            try:
+                rb_stats = self._road_block.stats()
+                result["multiprocess"]["road_block"] = rb_stats
+            except Exception:
+                pass
+
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -484,20 +824,34 @@ if __name__ == "__main__":
     mock_perf.get_latest_metrics.return_value = {}
     mock_perf.get_latest_levels.return_value = {}
 
-    # ── 测试 1：构造 ──
+    # ── 测试 1：构造 + init_multiprocess（预期 fallback，因为非 Linux 环境或无 /dev/shm） ──
     mgr = RouteManager(
         topology_graph=mock_graph,
         perf_monitor=mock_perf,
     )
     assert mgr._calculator is not None
-    errors.append("✓ 构造")
+    mp_ok = mgr.init_multiprocess()
+    errors.append(
+        f"✓ 构造 + init_multiprocess → {'multiprocess ENABLED' if mp_ok else 'thread fallback (expected)'}"
+    )
 
-    # ── 测试 2：on_events 触发 recompute_all ──
+    # ── 测试 2：on_events 触发 recompute_all（异步 SHM 路径 vs 同步线程路径） ──
     summary = mgr.on_events([MagicMock()])
     assert summary["switches"] == 5
-    assert summary["routes"] > 0
-    assert summary["p0_primary"] > 0
-    errors.append(f"✓ on_events → {summary['routes']} pairs, {summary['elapsed_ms']}ms")
+    is_async_shm = (summary.get("status") == "started_shm")
+    if is_async_shm:
+        # SHM 异步路径：等待子进程完成（最多 5s）
+        import time as _time
+        waited = 0.0
+        while waited < 5.0:
+            _time.sleep(0.1)
+            waited += 0.1
+            if mgr.get_route(1, 5, profile="realtime") is not None:
+                break
+        summary["routes"] = len(mgr.get_all_routes())
+    assert summary["routes"] > 0, f"Expected routes > 0, got {summary}"
+    mode_tag = summary.get("mode", summary.get("status", "?"))
+    errors.append(f"✓ on_events → {summary['routes']} pairs, {summary.get('elapsed_ms', '?')}ms [{mode_tag}]")
 
     # ── 测试 3：get_route ──
     route = mgr.get_route(1, 5, profile="realtime")
@@ -525,7 +879,8 @@ if __name__ == "__main__":
     s = mgr.stats()
     assert s["total_recomputes"] > 0
     assert s["cached_pairs"] > 0
-    errors.append("✓ stats")
+    mp_info = s.get("multiprocess", {})
+    errors.append(f"✓ stats (multiprocess enabled={mp_info.get('enabled', False)}, healthy={mp_info.get('healthy', False)})")
 
     # ── 测试 8：无拓扑图时 handle ──
     mgr2 = RouteManager()
@@ -538,6 +893,10 @@ if __name__ == "__main__":
     assert result is not None
     assert result["p0"]["primary"] is not None
     errors.append(f"✓ recompute_pair → {result['p0']['primary'].path}")
+
+    # ── 测试 10：shutdown_multiprocess ──
+    mgr.shutdown_multiprocess()
+    errors.append("✓ shutdown_multiprocess")
 
     print("\n".join(errors))
     print(f"\n✅ ALL {len(errors)} ROUTE MANAGER TESTS PASSED")

@@ -794,8 +794,8 @@ class ArpHandler:
                     self.logger.info(
                         f"[ArpHandler] Phase 2 (P0 dual-path, profile={profile}): "
                         f"{src_ip}({src_host.mac}) → {dst_ip}({dst_host.mac}) | "
-                        f"primary={primary.path} U={primary.utility:.4f} | "
-                        f"backup={backup.path} U={backup.utility:.4f} | "
+                        f"primary={primary.path} U={primary.u_final:.4f} | "
+                        f"backup={backup.path} U={backup.u_final:.4f} | "
                         f"{deployed} rules"
                     )
             else:
@@ -824,7 +824,7 @@ class ArpHandler:
                     self.logger.info(
                         f"[ArpHandler] Phase 2 (KSP+QoS, profile={profile}): "
                         f"{src_ip}({src_host.mac}) → {dst_ip}({dst_host.mac}) | "
-                        f"path={primary.path} | U={primary.utility:.4f} | "
+                        f"path={primary.path} | U={primary.u_final:.4f} | "
                         f"{deployed} rules"
                     )
 
